@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from bson import ObjectId
-from fastapi import FastAPI, Query, Response
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
@@ -24,16 +24,20 @@ app = FastAPI(title="Yesterday's Leads API")
 
 # =========================
 # CORS (FIXES WP/Elementor FETCH)
-# IMPORTANT: Origins MUST match exactly what the browser sends.
 # =========================
 ALLOWED_ORIGINS = [
-    "https://castudios.tv",
     "https://code.flywheelsites.com",
-    "https://www.code.flywheelsites.com",
     "https://first-wrist.flywheelsites.com",
+    "https://castudios.tv",
+    "https://www.castudios.tv",
     "http://localhost:3000",
     "http://localhost:5173",
 ]
+
+# Optional: add more origins via env var (comma separated)
+extra = os.environ.get("CORS_ORIGINS", "").strip()
+if extra:
+    ALLOWED_ORIGINS.extend([o.strip() for o in extra.split(",") if o.strip()])
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,6 +48,9 @@ app.add_middleware(
     max_age=86400,
 )
 
+# =========================
+# DB
+# =========================
 client = AsyncIOMotorClient(MONGO_URI)
 db = client[MONGO_DB]
 leads_col = db[MONGO_COLLECTION]
@@ -118,6 +125,15 @@ class LeadsResponse(BaseModel):
     items: List[LeadOut] = Field(default_factory=list)
 
 
+class LeadsSearchBody(BaseModel):
+    bucket: str = "YESTERDAY_72H"
+    page: int = 1
+    limit: int = 25
+    type_of_coverage: Optional[str] = None
+    state: Optional[str] = None
+    zip_code: Optional[str] = None
+
+
 class CheckoutRequest(BaseModel):
     bucket: str
     leadIds: List[str]
@@ -131,7 +147,7 @@ class CheckoutResponse(BaseModel):
 
 
 # =========================
-# HEALTH (optional but helpful)
+# HEALTH
 # =========================
 @app.get("/health")
 async def health():
@@ -143,17 +159,7 @@ async def health():
 
 
 # =========================
-# (Optional) preflight helper for legacy clients hitting /leads/search
-# If your HTML (or old docs) still uses POST /leads/search, this prevents
-# OPTIONS from returning 400 in some edge setups.
-# =========================
-@app.options("/leads/search")
-async def leads_search_preflight():
-    return Response(status_code=204)
-
-
-# =========================
-# ENDPOINT 1 — BROWSE
+# ENDPOINT — BROWSE (GET)
 # =========================
 @app.get("/leads", response_model=LeadsResponse)
 async def browse_leads(
@@ -166,7 +172,6 @@ async def browse_leads(
 ):
     skip = (page - 1) * limit
 
-    # ---- MODE A: tier-specific (fast find) ----
     if bucket != "ALL":
         filt: Dict[str, Any] = {}
         filt.update(age_filter(bucket))
@@ -191,7 +196,7 @@ async def browse_leads(
         items = [serialize(d) for d in docs]
         return {"bucket": bucket, "page": page, "limit": limit, "total": total, "items": items}
 
-    # ---- MODE B: ALL ages sorted by price (aggregation) ----
+    # ---- MODE B: ALL (kept, optional) ----
     ms_per_day = 24 * 60 * 60 * 1000
     pipeline: List[Dict[str, Any]] = []
 
@@ -226,9 +231,24 @@ async def browse_leads(
                     "$switch": {
                         "branches": [
                             {"case": {"$lte": ["$age_days", 3]}, "then": "YESTERDAY_72H"},
-                            {"case": {"$and": [{"$gte": ["$age_days", 4]}, {"$lte": ["$age_days", 14]}]}, "then": "DAYS_4_14"},
-                            {"case": {"$and": [{"$gte": ["$age_days", 15]}, {"$lte": ["$age_days", 30]}]}, "then": "DAYS_15_30"},
-                            {"case": {"$and": [{"$gte": ["$age_days", 31]}, {"$lte": ["$age_days", 90]}]}, "then": "DAYS_31_90"},
+                            {
+                                "case": {
+                                    "$and": [{"$gte": ["$age_days", 4]}, {"$lte": ["$age_days", 14]}]
+                                },
+                                "then": "DAYS_4_14",
+                            },
+                            {
+                                "case": {
+                                    "$and": [{"$gte": ["$age_days", 15]}, {"$lte": ["$age_days", 30]}]
+                                },
+                                "then": "DAYS_15_30",
+                            },
+                            {
+                                "case": {
+                                    "$and": [{"$gte": ["$age_days", 31]}, {"$lte": ["$age_days", 90]}]
+                                },
+                                "then": "DAYS_31_90",
+                            },
                         ],
                         "default": "DAYS_91_PLUS",
                     }
@@ -293,7 +313,34 @@ async def browse_leads(
 
 
 # =========================
-# ENDPOINT 2 — CHECKOUT
+# ENDPOINT — SEARCH (POST)  ✅ THIS FIXES YOUR 405
+# =========================
+@app.post("/leads/search")
+async def leads_search(body: LeadsSearchBody):
+    # Use the same logic as GET /leads but accept JSON body (what Flywheel is doing)
+    resp = await browse_leads(
+        bucket=body.bucket,
+        page=body.page,
+        limit=body.limit,
+        type_of_coverage=body.type_of_coverage,
+        state=body.state,
+        zip_code=body.zip_code,
+    )
+
+    # Return a response that works with multiple frontends
+    # (some want {count, items}, some want {total, items})
+    return {
+        "bucket": resp["bucket"],
+        "page": resp["page"],
+        "limit": resp["limit"],
+        "total": resp["total"],
+        "count": resp["total"],
+        "items": resp["items"],
+    }
+
+
+# =========================
+# ENDPOINT — CHECKOUT
 # =========================
 @app.post("/checkout", response_model=CheckoutResponse)
 async def checkout(body: CheckoutRequest):
@@ -302,7 +349,7 @@ async def checkout(body: CheckoutRequest):
 
     obj_ids = [ObjectId(x) for x in lead_ids]
 
-    res = await leads_col.update_many(
+    await leads_col.update_many(
         {"_id": {"$in": obj_ids}, "sold_tiers": {"$ne": bucket}},
         {"$addToSet": {"sold_tiers": bucket}},
     )
