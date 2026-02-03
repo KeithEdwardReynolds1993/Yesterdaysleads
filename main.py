@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, Field
 
 print("🚀 main.py loaded — sanity build", flush=True)
 
@@ -23,12 +25,36 @@ if not MONGO_URI:
 # =========================
 app = FastAPI(title="Yesterday's Leads API")
 
+# CORS (safe for your simple viewer; tighten later)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # =========================
 # DB
 # =========================
 client = AsyncIOMotorClient(MONGO_URI)
 db = client[MONGO_DB]
 leads_col = db[MONGO_COLLECTION]
+
+
+# =========================
+# MODELS
+# =========================
+class LeadsSearchRequest(BaseModel):
+    bucket: str = Field(default="ALL")  # ALL or YESTERDAY_72H, DAYS_4_14, etc.
+    page: int = Field(default=1, ge=1)
+    limit: int = Field(default=25, ge=1, le=200)
+
+    # optional filters
+    state: Optional[str] = None
+    zip: Optional[str] = None
+    lead_type_norm: Optional[str] = None
+
 
 # =========================
 # ROUTES
@@ -37,14 +63,16 @@ leads_col = db[MONGO_COLLECTION]
 async def health():
     return {"ok": True}
 
+
 @app.get("/__whoami")
 async def whoami():
     return {
         "ok": True,
         "file": "main.py",
         "service": "yesterdaysleads",
-        "version": "v2026-02-03-2",
+        "version": "v2026-02-03-3",
     }
+
 
 @app.get("/leads")
 async def leads():
@@ -58,3 +86,86 @@ async def leads():
 
     doc["id"] = str(doc.pop("_id"))
     return {"ok": True, "sample": doc}
+
+
+@app.post("/leads/search")
+async def leads_search(body: LeadsSearchRequest):
+    """
+    Search endpoint that matches your HTML viewer.
+
+    Expected doc fields (based on your sample):
+      - lead_age_bucket: "days_4_14" / "yesterday_72h" / etc (lowercase)
+      - sold_tiers: ["YESTERDAY_72H", ...] (uppercase)
+      - state or state2
+      - zip_code / zip5
+      - lead_type_norm
+      - status (optional)
+    """
+    # Build query
+    q: Dict[str, Any] = {}
+
+    # Bucket handling (support BOTH sold_tiers and lead_age_bucket)
+    if body.bucket and body.bucket.upper() != "ALL":
+        b_up = body.bucket.upper()
+        b_low = body.bucket.lower()
+        q["$or"] = [
+            {"sold_tiers": b_up},
+            {"lead_age_bucket": b_low},
+            {"lead_age_bucket": b_low.replace("_", "-")},  # just-in-case
+        ]
+
+    # We'll collect AND clauses (so bucket OR can combine with state/zip/type)
+    and_clauses: List[Dict[str, Any]] = []
+
+    # If bucket created an OR, preserve it as one AND clause
+    if "$or" in q:
+        and_clauses.append({"$or": q.pop("$or")})
+
+    if body.state:
+        st = body.state.strip().upper()
+        and_clauses.append({"$or": [{"state": st}, {"state2": st}]})
+
+    if body.zip:
+        z = "".join(ch for ch in body.zip.strip() if ch.isdigit())
+        if len(z) >= 5:
+            z = z[:5]
+        if z:
+            and_clauses.append({"$or": [{"zip5": z}, {"zip_code": z}]})
+
+    if body.lead_type_norm:
+        lt = body.lead_type_norm.strip().lower()
+        and_clauses.append({"lead_type_norm": lt})
+
+    # If you only want available leads, uncomment:
+    # and_clauses.append({"status": "Available"})
+
+    if and_clauses:
+        q = {"$and": and_clauses} if len(and_clauses) > 1 else and_clauses[0]
+
+    # Pagination
+    page = body.page
+    limit = body.limit
+    skip = (page - 1) * limit
+
+    # Sort newest first (use submittedAt/createdAt if present)
+    sort = [("submittedAt", -1), ("createdAt", -1)]
+
+    cursor = leads_col.find(q).sort(sort).skip(skip).limit(limit)
+    docs = await cursor.to_list(length=limit)
+
+    # total count (for UI)
+    total = await leads_col.count_documents(q)
+
+    items: List[Dict[str, Any]] = []
+    for d in docs:
+        d["id"] = str(d.pop("_id"))
+        items.append(d)
+
+    return {
+        "ok": True,
+        "page": page,
+        "limit": limit,
+        "total": total,
+        "items": items,
+        "query": q,
+    }
