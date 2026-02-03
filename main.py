@@ -1,5 +1,14 @@
-# main.py — FULL REPLACEMENT (single FastAPI app + whoami + debug + leads)
+# main.py — FULL REPLACEMENT (fix ResponseValidationError + add debug)
 from __future__ import annotations
+
+import os
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, List
+
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
+
 # =========================
 # CONFIG
 # =========================
@@ -8,25 +17,11 @@ MONGO_DB = os.environ.get("MONGO_DB", "leads")
 MONGO_COLLECTION = os.environ.get("MONGO_COLLECTION", "leads")
 
 if not MONGO_URI:
-    raise RuntimeError("Missing env var MONGO_URI")
+    raise RuntimeError("Missing MONGO_URI")
 
 app = FastAPI(title="Yesterday's Leads API")
 
-# =========================
-# ROUTES — SANITY
-# =========================
-@app.get("/__whoami")
-async def __whoami():
-    return {"ok": True, "file": "main.py", "version": "v2026-02-03-1"}
 
-@app.get("/health")
-async def health():
-    # keep it simple; if you want ping, add it here later
-    return {"ok": True}
-
-# =========================
-# CORS
-# =========================
 ALLOWED_ORIGINS = [
     "https://code.flywheelsites.com",
     "https://first-wrist.flywheelsites.com",
@@ -36,29 +31,18 @@ ALLOWED_ORIGINS = [
     "http://localhost:5173",
 ]
 
-extra = os.environ.get("CORS_ORIGINS", "").strip()
-if extra:
-    ALLOWED_ORIGINS.extend([o.strip() for o in extra.split(",") if o.strip()])
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    max_age=86400,
 )
 
-# =========================
-# DB
-# =========================
 client = AsyncIOMotorClient(MONGO_URI)
 db = client[MONGO_DB]
 leads_col = db[MONGO_COLLECTION]
 
-# =========================
-# CONSTANTS
-# =========================
 PRICE_BY_BUCKET = {
     "YESTERDAY_72H": 4.50,
     "DAYS_4_14": 3.75,
@@ -93,9 +77,6 @@ PROJECTION = {
     "coverage": 1,
 }
 
-# =========================
-# HELPERS
-# =========================
 def _as_str(v: Any) -> Optional[str]:
     if v is None:
         return None
@@ -117,7 +98,7 @@ def serialize(doc: Dict[str, Any]) -> Dict[str, Any]:
         d["id"] = str(d["_id"])
         del d["_id"]
 
-    # Normalize primitives
+    # Normalize primitive types to avoid ResponseValidationError
     if "state" in d:
         d["state"] = _as_str(d.get("state")) or "Unknown"
     if "state2" in d:
@@ -128,7 +109,6 @@ def serialize(doc: Dict[str, Any]) -> Dict[str, Any]:
     if "zip5" in d:
         d["zip5"] = _zip_to_str(d.get("zip5"))
 
-    # Normalize date objects
     for k in ("submitted_at", "submittedAt", "createdAt", "updatedAt", "ts"):
         if k in d and hasattr(d[k], "isoformat"):
             d[k] = d[k].isoformat()
@@ -163,25 +143,15 @@ def normalized_type(d: Dict[str, Any]) -> str:
     s = _as_str(val)
     return s if s else "Unknown"
 
-# =========================
-# DEBUG
-# =========================
 @app.get("/__debug_sample")
 async def __debug_sample():
     doc = await leads_col.find_one({}, PROJECTION)
     if not doc:
         return {"ok": False, "error": "no_docs"}
+    # show key->type for first doc so we can see if zip_code is int, etc
     types = {k: type(v).__name__ for k, v in doc.items()}
-    return {
-        "ok": True,
-        "keys": sorted(list(doc.keys())),
-        "types": types,
-        "doc_preview": serialize(doc),
-    }
+    return {"ok": True, "keys": sorted(list(doc.keys())), "types": types, "doc_preview": serialize(doc)}
 
-# =========================
-# LEADS
-# =========================
 @app.get("/leads")
 async def browse_leads(
     bucket: str = Query("DAYS_4_14"),
@@ -239,6 +209,7 @@ async def browse_leads(
                 item["lead_type_public"] = lt
                 item["lead_type_norm"] = lt
                 item["lead_type_code"] = _as_str(d.get("lead_type_code"))
+
                 item["price"] = float(PRICE_BY_BUCKET.get(bucket, 1.50))
                 item["bucket"] = bucket
                 items.append(item)
@@ -268,6 +239,7 @@ async def browse_leads(
         return {"bucket": "ALL", "page": page, "limit": limit, "total": total, "count": total, "items": items}
 
     except Exception as e:
+        # temporary: surface the error as JSON so you're not blind
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 @app.post("/leads/search")
@@ -280,3 +252,7 @@ async def leads_search(body: Dict[str, Any]):
         state=body.get("state"),
         zip_code=(body.get("zip") or body.get("zip_code") or None),
     )
+
+@app.get("/health")
+async def health():
+    return {"ok": True}
