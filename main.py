@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from bson import ObjectId
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
@@ -23,7 +23,7 @@ if not MONGO_URI:
 app = FastAPI(title="Yesterday's Leads API")
 
 # =========================
-# CORS (FIXES WP/Elementor FETCH)
+# CORS
 # =========================
 ALLOWED_ORIGINS = [
     "https://code.flywheelsites.com",
@@ -34,7 +34,6 @@ ALLOWED_ORIGINS = [
     "http://localhost:5173",
 ]
 
-# Optional: add more origins via env var (comma separated)
 extra = os.environ.get("CORS_ORIGINS", "").strip()
 if extra:
     ALLOWED_ORIGINS.extend([o.strip() for o in extra.split(",") if o.strip()])
@@ -71,33 +70,38 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def age_filter(bucket: str) -> Dict[str, Any]:
-    """
-    "Never show 0 days" rule: 1–3 days => YESTERDAY_72H
-    """
-    now = utcnow()
-    if bucket == "YESTERDAY_72H":
-        return {"submitted_at": {"$gte": now - timedelta(days=3), "$lte": now}}
-    if bucket == "DAYS_4_14":
-        return {"submitted_at": {"$gte": now - timedelta(days=14), "$lt": now - timedelta(days=3)}}
-    if bucket == "DAYS_15_30":
-        return {"submitted_at": {"$gte": now - timedelta(days=30), "$lt": now - timedelta(days=14)}}
-    if bucket == "DAYS_31_90":
-        return {"submitted_at": {"$gte": now - timedelta(days=90), "$lt": now - timedelta(days=30)}}
-    if bucket == "DAYS_91_PLUS":
-        return {"submitted_at": {"$lt": now - timedelta(days=90)}}
-    return {}  # ALL or unknown
-
-
 def serialize(doc: Dict[str, Any]) -> Dict[str, Any]:
     d = dict(doc)
     if "_id" in d:
         d["id"] = str(d["_id"])
         del d["_id"]
-    for k in ("submitted_at", "createdAt", "updatedAt"):
+
+    # normalize common date fields to iso strings
+    for k in ("submitted_at", "submittedAt", "createdAt", "updatedAt", "ts"):
         if k in d and hasattr(d[k], "isoformat"):
             d[k] = d[k].isoformat()
     return d
+
+
+def bucket_bounds(bucket: str) -> Dict[str, Any]:
+    """
+    Bucket logic based on a timestamp:
+    - Uses 72 hours for newest bucket
+    - uses days ranges for others
+    """
+    now = utcnow()
+
+    if bucket == "YESTERDAY_72H":
+        return {"$gte": now - timedelta(hours=72), "$lte": now}
+    if bucket == "DAYS_4_14":
+        return {"$gte": now - timedelta(days=14), "$lt": now - timedelta(days=4)}
+    if bucket == "DAYS_15_30":
+        return {"$gte": now - timedelta(days=30), "$lt": now - timedelta(days=15)}
+    if bucket == "DAYS_31_90":
+        return {"$gte": now - timedelta(days=90), "$lt": now - timedelta(days=31)}
+    if bucket == "DAYS_91_PLUS":
+        return {"$lt": now - timedelta(days=91)}
+    return {}
 
 
 # =========================
@@ -109,6 +113,7 @@ class LeadOut(BaseModel):
     state: Optional[str] = None
     zip_code: Optional[str] = None
     type_of_coverage: Optional[str] = None
+    createdAt: Optional[str] = None
     submitted_at: Optional[str] = None
 
     # computed only in ALL mode:
@@ -126,7 +131,7 @@ class LeadsResponse(BaseModel):
 
 
 class LeadsSearchBody(BaseModel):
-    bucket: str = "YESTERDAY_72H"
+    bucket: str = "DAYS_4_14"
     page: int = 1
     limit: int = 25
     type_of_coverage: Optional[str] = None
@@ -163,7 +168,7 @@ async def health():
 # =========================
 @app.get("/leads", response_model=LeadsResponse)
 async def browse_leads(
-    bucket: str = Query("YESTERDAY_72H"),
+    bucket: str = Query("DAYS_4_14"),
     page: int = Query(1, ge=1),
     limit: int = Query(25, ge=1, le=200),
     type_of_coverage: Optional[str] = Query(None),
@@ -172,9 +177,17 @@ async def browse_leads(
 ):
     skip = (page - 1) * limit
 
+    # =========================
+    # MODE A: NON-ALL (simple find)
+    # =========================
     if bucket != "ALL":
+        # We filter by a safe timestamp field:
+        # ts = createdAt (preferred) else submittedAt else submitted_at
+        bounds = bucket_bounds(bucket)
+
+        # Build match
         filt: Dict[str, Any] = {}
-        filt.update(age_filter(bucket))
+        # Sold logic: if sold_tiers missing, still matches (good)
         filt["sold_tiers"] = {"$ne": bucket}
 
         if type_of_coverage:
@@ -184,10 +197,35 @@ async def browse_leads(
         if zip_code:
             filt["zip_code"] = zip_code
 
+        # We'll do timestamp bounds with $expr so we can use fallback fields
+        if bounds:
+            # Convert bucket bounds to an $expr against the chosen ts
+            # (We compute ts inside the expression using $ifNull chain)
+            ts_expr = {
+                "$ifNull": [
+                    "$createdAt",
+                    {"$ifNull": ["$submittedAt", "$submitted_at"]},
+                ]
+            }
+
+            # Apply bounds (gte/lt/lte) via $expr
+            expr_parts = []
+            if "$gte" in bounds:
+                expr_parts.append({"$gte": [ts_expr, bounds["$gte"]]})
+            if "$lt" in bounds:
+                expr_parts.append({"$lt": [ts_expr, bounds["$lt"]]})
+            if "$lte" in bounds:
+                expr_parts.append({"$lte": [ts_expr, bounds["$lte"]]})
+
+            # also ensure ts is a date
+            expr_parts.insert(0, {"$eq": [{"$type": ts_expr}, "date"]})
+
+            filt["$expr"] = {"$and": expr_parts}
+
         total = await leads_col.count_documents(filt)
         docs = await (
             leads_col.find(filt)
-            .sort("submitted_at", -1)
+            .sort("createdAt", -1)  # best effort; docs lacking createdAt still work via filt
             .skip(skip)
             .limit(limit)
             .to_list(length=limit)
@@ -196,10 +234,13 @@ async def browse_leads(
         items = [serialize(d) for d in docs]
         return {"bucket": bucket, "page": page, "limit": limit, "total": total, "items": items}
 
-    # ---- MODE B: ALL (kept, optional) ----
+    # =========================
+    # MODE B: ALL (aggregation) ✅ FIXED
+    # =========================
     ms_per_day = 24 * 60 * 60 * 1000
     pipeline: List[Dict[str, Any]] = []
 
+    # Optional filters
     if type_of_coverage:
         pipeline.append({"$match": {"type_of_coverage": type_of_coverage}})
     if state:
@@ -207,6 +248,24 @@ async def browse_leads(
     if zip_code:
         pipeline.append({"$match": {"zip_code": zip_code}})
 
+    # ✅ Pick a timestamp that exists (createdAt preferred)
+    pipeline.append(
+        {
+            "$addFields": {
+                "ts": {
+                    "$ifNull": [
+                        "$createdAt",
+                        {"$ifNull": ["$submittedAt", "$submitted_at"]},
+                    ]
+                }
+            }
+        }
+    )
+
+    # ✅ Drop docs with no timestamp or wrong type
+    pipeline.append({"$match": {"ts": {"$type": "date"}}})
+
+    # ✅ Age days from ts (safe)
     pipeline.append(
         {
             "$addFields": {
@@ -215,7 +274,7 @@ async def browse_leads(
                         1,
                         {
                             "$floor": {
-                                "$divide": [{"$subtract": ["$$NOW", "$submitted_at"]}, ms_per_day]
+                                "$divide": [{"$subtract": ["$$NOW", "$ts"]}, ms_per_day]
                             }
                         },
                     ]
@@ -224,6 +283,7 @@ async def browse_leads(
         }
     )
 
+    # Bucket mapping
     pipeline.append(
         {
             "$addFields": {
@@ -232,21 +292,15 @@ async def browse_leads(
                         "branches": [
                             {"case": {"$lte": ["$age_days", 3]}, "then": "YESTERDAY_72H"},
                             {
-                                "case": {
-                                    "$and": [{"$gte": ["$age_days", 4]}, {"$lte": ["$age_days", 14]}]
-                                },
+                                "case": {"$and": [{"$gte": ["$age_days", 4]}, {"$lte": ["$age_days", 14]}]},
                                 "then": "DAYS_4_14",
                             },
                             {
-                                "case": {
-                                    "$and": [{"$gte": ["$age_days", 15]}, {"$lte": ["$age_days", 30]}]
-                                },
+                                "case": {"$and": [{"$gte": ["$age_days", 15]}, {"$lte": ["$age_days", 30]}]},
                                 "then": "DAYS_15_30",
                             },
                             {
-                                "case": {
-                                    "$and": [{"$gte": ["$age_days", 31]}, {"$lte": ["$age_days", 90]}]
-                                },
+                                "case": {"$and": [{"$gte": ["$age_days", 31]}, {"$lte": ["$age_days", 90]}]},
                                 "then": "DAYS_31_90",
                             },
                         ],
@@ -257,8 +311,13 @@ async def browse_leads(
         }
     )
 
-    pipeline.append({"$match": {"$expr": {"$not": {"$in": ["$bucket", "$sold_tiers"]}}}})
+    # ✅ sold_tiers may be missing. Treat missing as []
+    pipeline.append({"$addFields": {"sold_tiers_safe": {"$ifNull": ["$sold_tiers", []]}}})
 
+    # Exclude already-sold tiers
+    pipeline.append({"$match": {"$expr": {"$not": {"$in": ["$bucket", "$sold_tiers_safe"]}}}})
+
+    # Price per bucket
     pipeline.append(
         {
             "$addFields": {
@@ -277,8 +336,10 @@ async def browse_leads(
         }
     )
 
-    pipeline.append({"$sort": {"price": 1, "submitted_at": -1}})
+    # Sort: cheapest first, then newest
+    pipeline.append({"$sort": {"price": 1, "ts": -1}})
 
+    # Pagination + total via facet
     pipeline.append(
         {
             "$facet": {
@@ -291,7 +352,7 @@ async def browse_leads(
                             "state": 1,
                             "zip_code": 1,
                             "type_of_coverage": 1,
-                            "submitted_at": 1,
+                            "createdAt": "$ts",
                             "age_days": 1,
                             "bucket": 1,
                             "price": 1,
@@ -303,7 +364,11 @@ async def browse_leads(
         }
     )
 
-    res = await leads_col.aggregate(pipeline).to_list(length=1)
+    try:
+        res = await leads_col.aggregate(pipeline).to_list(length=1)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"agg_failed: {type(e).__name__}: {str(e)}")
+
     facet = res[0] if res else {"items": [], "meta": []}
     total = (facet.get("meta") or [{}])[0].get("total", 0)
     docs = facet.get("items") or []
@@ -313,11 +378,10 @@ async def browse_leads(
 
 
 # =========================
-# ENDPOINT — SEARCH (POST)  ✅ THIS FIXES YOUR 405
+# ENDPOINT — SEARCH (POST)
 # =========================
 @app.post("/leads/search")
 async def leads_search(body: LeadsSearchBody):
-    # Use the same logic as GET /leads but accept JSON body (what Flywheel is doing)
     resp = await browse_leads(
         bucket=body.bucket,
         page=body.page,
@@ -326,9 +390,6 @@ async def leads_search(body: LeadsSearchBody):
         state=body.state,
         zip_code=body.zip_code,
     )
-
-    # Return a response that works with multiple frontends
-    # (some want {count, items}, some want {total, items})
     return {
         "bucket": resp["bucket"],
         "page": resp["page"],
@@ -347,7 +408,10 @@ async def checkout(body: CheckoutRequest):
     bucket = body.bucket
     lead_ids = body.leadIds
 
-    obj_ids = [ObjectId(x) for x in lead_ids]
+    try:
+        obj_ids = [ObjectId(x) for x in lead_ids]
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid leadIds (must be Mongo ObjectId strings)")
 
     await leads_col.update_many(
         {"_id": {"$in": obj_ids}, "sold_tiers": {"$ne": bucket}},
