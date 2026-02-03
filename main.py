@@ -1,16 +1,5 @@
 # main.py — FULL REPLACEMENT (single FastAPI app + whoami + debug + leads)
 from __future__ import annotations
-
-print("🚀 LOADED main.py — v2026-02-03-1", flush=True)
-
-import os
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, List
-
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
-
 # =========================
 # CONFIG
 # =========================
