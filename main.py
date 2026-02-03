@@ -1,30 +1,42 @@
+print("🚀 LOADED main.py — v2026-02-03-1", flush=True)
+
+from fastapi import FastAPI
+
+app = FastAPI(title="Yesterday's Leads API")
+
+@app.get("/__whoami")
+def whoami():
+    return {"ok": True, "file": "main.py", "version": "v2026-02-03-1"}
+
+
+# main.py — FULL REPLACEMENT (fix ResponseValidationError + add debug)
 from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional, List
 
-from bson import ObjectId
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, Field
 
 # =========================
-# CONFIG (ENV VARS)
+# CONFIG
 # =========================
-MONGO_URI = os.environ.get("MONGO_URI")  # mongodb+srv://...
+MONGO_URI = os.environ.get("MONGO_URI")
 MONGO_DB = os.environ.get("MONGO_DB", "leads")
 MONGO_COLLECTION = os.environ.get("MONGO_COLLECTION", "leads")
 
 if not MONGO_URI:
-    raise RuntimeError("Missing env var MONGO_URI (mongodb+srv://...)")
+    raise RuntimeError("Missing MONGO_URI")
 
 app = FastAPI(title="Yesterday's Leads API")
 
-# =========================
-# CORS
-# =========================
+@app.get("/__whoami")
+async def __whoami():
+    return {"ok": True, "file": "root main.py", "status": "live"}
+
+
 ALLOWED_ORIGINS = [
     "https://code.flywheelsites.com",
     "https://first-wrist.flywheelsites.com",
@@ -34,29 +46,18 @@ ALLOWED_ORIGINS = [
     "http://localhost:5173",
 ]
 
-extra = os.environ.get("CORS_ORIGINS", "").strip()
-if extra:
-    ALLOWED_ORIGINS.extend([o.strip() for o in extra.split(",") if o.strip()])
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
-    max_age=86400,
 )
 
-# =========================
-# DB
-# =========================
 client = AsyncIOMotorClient(MONGO_URI)
 db = client[MONGO_DB]
 leads_col = db[MONGO_COLLECTION]
 
-# =========================
-# CONSTANTS
-# =========================
 PRICE_BY_BUCKET = {
     "YESTERDAY_72H": 4.50,
     "DAYS_4_14": 3.75,
@@ -65,32 +66,72 @@ PRICE_BY_BUCKET = {
     "DAYS_91_PLUS": 1.50,
 }
 
+PROJECTION = {
+    "_id": 1,
+    "external_id": 1,
+    "name": 1,
+    "first_name": 1,
+    "firstName": 1,
+    "last_name": 1,
+    "lastName": 1,
+    "state": 1,
+    "state2": 1,
+    "zip_code": 1,
+    "zip5": 1,
+    "createdAt": 1,
+    "submittedAt": 1,
+    "submitted_at": 1,
+    "sold_tiers": 1,
+    "lead_type_public": 1,
+    "lead_type_norm": 1,
+    "lead_type_code": 1,
+    "lead_type": 1,
+    "type_of_coverage": 1,
+    "leadType": 1,
+    "product": 1,
+    "coverage": 1,
+}
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+def _as_str(v: Any) -> Optional[str]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s else None
 
+def _zip_to_str(v: Any) -> Optional[str]:
+    s = _as_str(v)
+    if not s:
+        return None
+    if s.isdigit() and len(s) < 5:
+        s = s.zfill(5)
+    return s
 
 def serialize(doc: Dict[str, Any]) -> Dict[str, Any]:
     d = dict(doc)
+
     if "_id" in d:
         d["id"] = str(d["_id"])
         del d["_id"]
 
-    # normalize common date fields to iso strings
+    # Normalize primitive types to avoid ResponseValidationError
+    if "state" in d:
+        d["state"] = _as_str(d.get("state")) or "Unknown"
+    if "state2" in d:
+        d["state2"] = _as_str(d.get("state2"))
+
+    if "zip_code" in d:
+        d["zip_code"] = _zip_to_str(d.get("zip_code"))
+    if "zip5" in d:
+        d["zip5"] = _zip_to_str(d.get("zip5"))
+
     for k in ("submitted_at", "submittedAt", "createdAt", "updatedAt", "ts"):
         if k in d and hasattr(d[k], "isoformat"):
             d[k] = d[k].isoformat()
+
     return d
 
-
 def bucket_bounds(bucket: str) -> Dict[str, Any]:
-    """
-    Bucket logic based on a timestamp:
-    - Uses 72 hours for newest bucket
-    - uses days ranges for others
-    """
-    now = utcnow()
-
+    now = datetime.now(timezone.utc)
     if bucket == "YESTERDAY_72H":
         return {"$gte": now - timedelta(hours=72), "$lte": now}
     if bucket == "DAYS_4_14":
@@ -103,329 +144,130 @@ def bucket_bounds(bucket: str) -> Dict[str, Any]:
         return {"$lt": now - timedelta(days=91)}
     return {}
 
+def normalized_type(d: Dict[str, Any]) -> str:
+    val = (
+        d.get("lead_type_public")
+        or d.get("lead_type_norm")
+        or d.get("lead_type_code")
+        or d.get("lead_type")
+        or d.get("type_of_coverage")
+        or d.get("leadType")
+        or d.get("product")
+        or d.get("coverage")
+    )
+    s = _as_str(val)
+    return s if s else "Unknown"
 
-# =========================
-# MODELS
-# =========================
-class LeadOut(BaseModel):
-    id: str
-    name: Optional[str] = None
-    state: Optional[str] = None
-    zip_code: Optional[str] = None
-    type_of_coverage: Optional[str] = None
-    createdAt: Optional[str] = None
-    submitted_at: Optional[str] = None
+@app.get("/__debug_sample")
+async def __debug_sample():
+    doc = await leads_col.find_one({}, PROJECTION)
+    if not doc:
+        return {"ok": False, "error": "no_docs"}
+    # show key->type for first doc so we can see if zip_code is int, etc
+    types = {k: type(v).__name__ for k, v in doc.items()}
+    return {"ok": True, "keys": sorted(list(doc.keys())), "types": types, "doc_preview": serialize(doc)}
 
-    # computed only in ALL mode:
-    age_days: Optional[int] = None
-    bucket: Optional[str] = None
-    price: Optional[float] = None
-
-
-class LeadsResponse(BaseModel):
-    bucket: str
-    page: int
-    limit: int
-    total: int
-    items: List[LeadOut] = Field(default_factory=list)
-
-
-class LeadsSearchBody(BaseModel):
-    bucket: str = "DAYS_4_14"
-    page: int = 1
-    limit: int = 25
-    type_of_coverage: Optional[str] = None
-    state: Optional[str] = None
-    zip_code: Optional[str] = None
-
-
-class CheckoutRequest(BaseModel):
-    bucket: str
-    leadIds: List[str]
-
-
-class CheckoutResponse(BaseModel):
-    bucket: str
-    requested: int
-    sold: int
-    failed: List[str] = Field(default_factory=list)
-
-
-# =========================
-# HEALTH
-# =========================
-@app.get("/health")
-async def health():
-    try:
-        await db.command("ping")
-        return {"ok": True, "mongo_configured": True}
-    except Exception:
-        return {"ok": True, "mongo_configured": False}
-
-
-# =========================
-# ENDPOINT — BROWSE (GET)
-# =========================
-@app.get("/leads", response_model=LeadsResponse)
+@app.get("/leads")
 async def browse_leads(
     bucket: str = Query("DAYS_4_14"),
     page: int = Query(1, ge=1),
     limit: int = Query(25, ge=1, le=200),
-    type_of_coverage: Optional[str] = Query(None),
+    lead_type: Optional[str] = Query(None),
     state: Optional[str] = Query(None),
     zip_code: Optional[str] = Query(None),
 ):
-    skip = (page - 1) * limit
+    try:
+        skip = (page - 1) * limit
 
-    # =========================
-    # MODE A: NON-ALL (simple find)
-    # =========================
-    if bucket != "ALL":
-        # We filter by a safe timestamp field:
-        # ts = createdAt (preferred) else submittedAt else submitted_at
-        bounds = bucket_bounds(bucket)
-
-        # Build match
         filt: Dict[str, Any] = {}
-        # Sold logic: if sold_tiers missing, still matches (good)
-        filt["sold_tiers"] = {"$ne": bucket}
-
-        if type_of_coverage:
-            filt["type_of_coverage"] = type_of_coverage
+        if lead_type:
+            filt["lead_type_norm"] = lead_type
         if state:
             filt["state"] = state
         if zip_code:
-            filt["zip_code"] = zip_code
+            z = zip_code.strip()
+            ors = [{"zip_code": z}, {"zip5": z}]
+            if z.isdigit():
+                ors += [{"zip_code": int(z)}, {"zip5": int(z)}]
+            filt["$or"] = ors
 
-        # We'll do timestamp bounds with $expr so we can use fallback fields
-        if bounds:
-            # Convert bucket bounds to an $expr against the chosen ts
-            # (We compute ts inside the expression using $ifNull chain)
-            ts_expr = {
-                "$ifNull": [
-                    "$createdAt",
-                    {"$ifNull": ["$submittedAt", "$submitted_at"]},
-                ]
-            }
+        expr_and: List[Dict[str, Any]] = []
+        expr_and.append({"$not": {"$in": [bucket, {"$ifNull": ["$sold_tiers", []]}]}})
 
-            # Apply bounds (gte/lt/lte) via $expr
-            expr_parts = []
-            if "$gte" in bounds:
-                expr_parts.append({"$gte": [ts_expr, bounds["$gte"]]})
-            if "$lt" in bounds:
-                expr_parts.append({"$lt": [ts_expr, bounds["$lt"]]})
-            if "$lte" in bounds:
-                expr_parts.append({"$lte": [ts_expr, bounds["$lte"]]})
+        if bucket != "ALL":
+            bounds = bucket_bounds(bucket)
+            if bounds:
+                ts_expr = {"$ifNull": ["$createdAt", {"$ifNull": ["$submittedAt", "$submitted_at"]}]}
+                expr_and.append({"$eq": [{"$type": ts_expr}, "date"]})
+                if "$gte" in bounds:
+                    expr_and.append({"$gte": [ts_expr, bounds["$gte"]]})
+                if "$lt" in bounds:
+                    expr_and.append({"$lt": [ts_expr, bounds["$lt"]]})
+                if "$lte" in bounds:
+                    expr_and.append({"$lte": [ts_expr, bounds["$lte"]]})
 
-            # also ensure ts is a date
-            expr_parts.insert(0, {"$eq": [{"$type": ts_expr}, "date"]})
+            filt["$expr"] = {"$and": expr_and}
 
-            filt["$expr"] = {"$and": expr_parts}
+            total = await leads_col.count_documents(filt)
+            docs = (
+                await leads_col.find(filt, PROJECTION)
+                .sort([("createdAt", -1), ("submittedAt", -1), ("submitted_at", -1)])
+                .skip(skip)
+                .limit(limit)
+                .to_list(length=limit)
+            )
 
-        total = await leads_col.count_documents(filt)
-        docs = await (
-            leads_col.find(filt)
-            .sort("createdAt", -1)  # best effort; docs lacking createdAt still work via filt
+            items = []
+            for d in docs:
+                item = serialize(d)
+                lt = normalized_type(d)
+                item["lead_type_public"] = lt
+                item["lead_type_norm"] = lt
+                item["lead_type_code"] = _as_str(d.get("lead_type_code"))
+
+                item["price"] = float(PRICE_BY_BUCKET.get(bucket, 1.50))
+                item["bucket"] = bucket
+                items.append(item)
+
+            return {"bucket": bucket, "page": page, "limit": limit, "total": total, "count": total, "items": items}
+
+        total = await leads_col.count_documents(filt if filt else {})
+        docs = (
+            await leads_col.find(filt if filt else {}, PROJECTION)
+            .sort([("createdAt", -1), ("submittedAt", -1), ("submitted_at", -1)])
             .skip(skip)
             .limit(limit)
             .to_list(length=limit)
         )
 
-        items = [serialize(d) for d in docs]
-        return {"bucket": bucket, "page": page, "limit": limit, "total": total, "items": items}
+        items = []
+        for d in docs:
+            item = serialize(d)
+            lt = normalized_type(d)
+            item["lead_type_public"] = lt
+            item["lead_type_norm"] = lt
+            item["lead_type_code"] = _as_str(d.get("lead_type_code"))
+            item["price"] = float(item.get("price") or 1.50)
+            item["bucket"] = "ALL"
+            items.append(item)
 
-    # =========================
-    # MODE B: ALL (aggregation) ✅ FIXED
-    # =========================
-    ms_per_day = 24 * 60 * 60 * 1000
-    pipeline: List[Dict[str, Any]] = []
+        return {"bucket": "ALL", "page": page, "limit": limit, "total": total, "count": total, "items": items}
 
-    # Optional filters
-    if type_of_coverage:
-        pipeline.append({"$match": {"type_of_coverage": type_of_coverage}})
-    if state:
-        pipeline.append({"$match": {"state": state}})
-    if zip_code:
-        pipeline.append({"$match": {"zip_code": zip_code}})
-
-    # ✅ Pick a timestamp that exists (createdAt preferred)
-    pipeline.append(
-        {
-            "$addFields": {
-                "ts": {
-                    "$ifNull": [
-                        "$createdAt",
-                        {"$ifNull": ["$submittedAt", "$submitted_at"]},
-                    ]
-                }
-            }
-        }
-    )
-
-    # ✅ Drop docs with no timestamp or wrong type
-    pipeline.append({"$match": {"ts": {"$type": "date"}}})
-
-    # ✅ Age days from ts (safe)
-    pipeline.append(
-        {
-            "$addFields": {
-                "age_days": {
-                    "$add": [
-                        1,
-                        {
-                            "$floor": {
-                                "$divide": [{"$subtract": ["$$NOW", "$ts"]}, ms_per_day]
-                            }
-                        },
-                    ]
-                }
-            }
-        }
-    )
-
-    # Bucket mapping
-    pipeline.append(
-        {
-            "$addFields": {
-                "bucket": {
-                    "$switch": {
-                        "branches": [
-                            {"case": {"$lte": ["$age_days", 3]}, "then": "YESTERDAY_72H"},
-                            {
-                                "case": {"$and": [{"$gte": ["$age_days", 4]}, {"$lte": ["$age_days", 14]}]},
-                                "then": "DAYS_4_14",
-                            },
-                            {
-                                "case": {"$and": [{"$gte": ["$age_days", 15]}, {"$lte": ["$age_days", 30]}]},
-                                "then": "DAYS_15_30",
-                            },
-                            {
-                                "case": {"$and": [{"$gte": ["$age_days", 31]}, {"$lte": ["$age_days", 90]}]},
-                                "then": "DAYS_31_90",
-                            },
-                        ],
-                        "default": "DAYS_91_PLUS",
-                    }
-                }
-            }
-        }
-    )
-
-    # ✅ sold_tiers may be missing. Treat missing as []
-    pipeline.append({"$addFields": {"sold_tiers_safe": {"$ifNull": ["$sold_tiers", []]}}})
-
-    # Exclude already-sold tiers
-    pipeline.append({"$match": {"$expr": {"$not": {"$in": ["$bucket", "$sold_tiers_safe"]}}}})
-
-    # Price per bucket
-    pipeline.append(
-        {
-            "$addFields": {
-                "price": {
-                    "$switch": {
-                        "branches": [
-                            {"case": {"$eq": ["$bucket", "YESTERDAY_72H"]}, "then": 4.50},
-                            {"case": {"$eq": ["$bucket", "DAYS_4_14"]}, "then": 3.75},
-                            {"case": {"$eq": ["$bucket", "DAYS_15_30"]}, "then": 3.00},
-                            {"case": {"$eq": ["$bucket", "DAYS_31_90"]}, "then": 2.25},
-                        ],
-                        "default": 1.50,
-                    }
-                }
-            }
-        }
-    )
-
-    # Sort: cheapest first, then newest
-    pipeline.append({"$sort": {"price": 1, "ts": -1}})
-
-    # Pagination + total via facet
-    pipeline.append(
-        {
-            "$facet": {
-                "items": [
-                    {"$skip": skip},
-                    {"$limit": limit},
-                    {
-                        "$project": {
-                            "name": 1,
-                            "state": 1,
-                            "zip_code": 1,
-                            "type_of_coverage": 1,
-                            "createdAt": "$ts",
-                            "age_days": 1,
-                            "bucket": 1,
-                            "price": 1,
-                        }
-                    },
-                ],
-                "meta": [{"$count": "total"}],
-            }
-        }
-    )
-
-    try:
-        res = await leads_col.aggregate(pipeline).to_list(length=1)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"agg_failed: {type(e).__name__}: {str(e)}")
+        # temporary: surface the error as JSON so you're not blind
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
-    facet = res[0] if res else {"items": [], "meta": []}
-    total = (facet.get("meta") or [{}])[0].get("total", 0)
-    docs = facet.get("items") or []
-
-    items = [serialize(d) for d in docs]
-    return {"bucket": "ALL", "page": page, "limit": limit, "total": total, "items": items}
-
-
-# =========================
-# ENDPOINT — SEARCH (POST)
-# =========================
 @app.post("/leads/search")
-async def leads_search(body: LeadsSearchBody):
-    resp = await browse_leads(
-        bucket=body.bucket,
-        page=body.page,
-        limit=body.limit,
-        type_of_coverage=body.type_of_coverage,
-        state=body.state,
-        zip_code=body.zip_code,
-    )
-    return {
-        "bucket": resp["bucket"],
-        "page": resp["page"],
-        "limit": resp["limit"],
-        "total": resp["total"],
-        "count": resp["total"],
-        "items": resp["items"],
-    }
-
-
-# =========================
-# ENDPOINT — CHECKOUT
-# =========================
-@app.post("/checkout", response_model=CheckoutResponse)
-async def checkout(body: CheckoutRequest):
-    bucket = body.bucket
-    lead_ids = body.leadIds
-
-    try:
-        obj_ids = [ObjectId(x) for x in lead_ids]
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid leadIds (must be Mongo ObjectId strings)")
-
-    await leads_col.update_many(
-        {"_id": {"$in": obj_ids}, "sold_tiers": {"$ne": bucket}},
-        {"$addToSet": {"sold_tiers": bucket}},
+async def leads_search(body: Dict[str, Any]):
+    return await browse_leads(
+        bucket=body.get("bucket", "DAYS_4_14"),
+        page=int(body.get("page", 1) or 1),
+        limit=int(body.get("limit", 25) or 25),
+        lead_type=(body.get("lead_type") or body.get("lead_type_norm") or None),
+        state=body.get("state"),
+        zip_code=(body.get("zip") or body.get("zip_code") or None),
     )
 
-    requested = len(lead_ids)
-
-    sold_now = await leads_col.find(
-        {"_id": {"$in": obj_ids}, "sold_tiers": bucket},
-        {"_id": 1},
-    ).to_list(length=requested)
-
-    sold_set = {str(d["_id"]) for d in sold_now}
-    failed = [x for x in lead_ids if x not in sold_set]
-
-    return {"bucket": bucket, "requested": requested, "sold": len(sold_set), "failed": failed}
+@app.get("/health")
+async def health():
+    return {"ok": True}
