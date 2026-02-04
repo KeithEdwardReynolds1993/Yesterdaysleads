@@ -16,8 +16,7 @@ print("🚀 main.py loaded — sanity build", flush=True)
 MONGO_URI = os.environ.get("MONGO_URI")
 MONGO_DB = os.environ.get("MONGO_DB", "leads")
 
-# ✅ IMPORTANT: your real Atlas collection is LeadsData (per your screenshots)
-# You can still override with env var, but the default must be correct.
+# ✅ IMPORTANT: your real Atlas collection is LeadsData (case-sensitive)
 MONGO_COLLECTION = os.environ.get("MONGO_COLLECTION", "LeadsData")
 
 SERVICE_NAME = os.environ.get("SERVICE_NAME", "yesterdaysleads")
@@ -31,10 +30,9 @@ if not MONGO_URI:
 # =========================
 app = FastAPI(title="Yesterday's Leads API")
 
-# CORS (safe for your simple viewer; tighten later)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # tighten later
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,23 +41,11 @@ app.add_middleware(
 # =========================
 # DB
 # =========================
-if not MONGO_URI:
-    raise RuntimeError("Missing env var MONGO_URI")
-
-# IMPORTANT:
-# Mongo collection names ARE case-sensitive.
-# Your real collection is: LeadsData
 client = AsyncIOMotorClient(MONGO_URI)
+db = client[MONGO_DB]
+leads_col = db[MONGO_COLLECTION]
 
-db = client[os.environ.get("MONGO_DB", "leads")]
-
-leads_col = db[os.environ.get("MONGO_COLLECTION", "LeadsData")]
-
-print(
-    f"🧠 Mongo connected → DB='{db.name}', Collection='{leads_col.name}'",
-    flush=True
-)
-
+print(f"🧠 Mongo connected → DB='{db.name}', Collection='{leads_col.name}'", flush=True)
 
 # =========================
 # MODELS
@@ -100,18 +86,42 @@ async def whoami():
     }
 
 
+@app.get("/__mongo")
+async def __mongo():
+    """
+    Debug endpoint to confirm Render is running the code you THINK it is,
+    and which DB/collection it is pointed at.
+    """
+    return {
+        "ok": True,
+        "mongo_db": db.name,
+        "mongo_collection": leads_col.name,
+    }
+
+
 @app.get("/leads")
 async def leads():
     """
     Absolute simplest Mongo test.
-    If this returns a sample doc, your Render deploy + Mongo collection are correct.
+    If this returns count>0 and a sample doc, your Render deploy + Mongo collection are correct.
     """
     doc = await leads_col.find_one({})
     if not doc:
-        return {"ok": True, "count": 0, "mongo_db": MONGO_DB, "mongo_collection": MONGO_COLLECTION}
+        return {
+            "ok": True,
+            "count": 0,
+            "mongo_db": db.name,
+            "mongo_collection": leads_col.name,
+        }
 
     doc["id"] = str(doc.pop("_id"))
-    return {"ok": True, "sample": doc, "mongo_db": MONGO_DB, "mongo_collection": MONGO_COLLECTION}
+    return {
+        "ok": True,
+        "count": 1,
+        "sample": doc,
+        "mongo_db": db.name,
+        "mongo_collection": leads_col.name,
+    }
 
 
 @app.post("/leads/search")
@@ -127,20 +137,22 @@ async def leads_search(body: LeadsSearchRequest):
       - lead_type_norm
       - status (optional)
     """
-    q: Dict[str, Any] = {}
     and_clauses: List[Dict[str, Any]] = []
 
     # Bucket handling (support BOTH sold_tiers and lead_age_bucket)
-    if body.bucket and body.bucket.strip().upper() != "ALL":
-        b_up = body.bucket.strip().upper()
-        b_low = body.bucket.strip().lower()
-        and_clauses.append({
-            "$or": [
-                {"sold_tiers": b_up},
-                {"lead_age_bucket": b_low},
-                {"lead_age_bucket": b_low.replace("_", "-")},
-            ]
-        })
+    bucket_raw = (body.bucket or "").strip()
+    if bucket_raw and bucket_raw.upper() != "ALL":
+        b_up = bucket_raw.upper()
+        b_low = bucket_raw.lower()
+        and_clauses.append(
+            {
+                "$or": [
+                    {"sold_tiers": b_up},
+                    {"lead_age_bucket": b_low},
+                    {"lead_age_bucket": b_low.replace("_", "-")},
+                ]
+            }
+        )
 
     if body.state:
         st = body.state.strip().upper()
@@ -148,8 +160,7 @@ async def leads_search(body: LeadsSearchRequest):
 
     if body.zip:
         z = "".join(ch for ch in body.zip.strip() if ch.isdigit())
-        if len(z) >= 5:
-            z = z[:5]
+        z = z[:5] if len(z) >= 5 else z
         if z:
             and_clauses.append({"$or": [{"zip5": z}, {"zip_code": z}]})
 
@@ -157,6 +168,7 @@ async def leads_search(body: LeadsSearchRequest):
         lt = body.lead_type_norm.strip().lower()
         and_clauses.append({"lead_type_norm": lt})
 
+    q: Dict[str, Any] = {}
     if and_clauses:
         q = {"$and": and_clauses} if len(and_clauses) > 1 else and_clauses[0]
 
@@ -170,7 +182,6 @@ async def leads_search(body: LeadsSearchRequest):
 
     cursor = leads_col.find(q).sort(sort).skip(skip).limit(limit)
     docs = await cursor.to_list(length=limit)
-
     total = await leads_col.count_documents(q)
 
     items: List[Dict[str, Any]] = []
@@ -184,6 +195,8 @@ async def leads_search(body: LeadsSearchRequest):
         "limit": limit,
         "total": total,
         "items": items,
-        "bucket": body.bucket.strip().upper() if body.bucket else "ALL",
+        "bucket": bucket_raw.upper() if bucket_raw else "ALL",
         "query": q,
+        "mongo_db": db.name,
+        "mongo_collection": leads_col.name,
     }
