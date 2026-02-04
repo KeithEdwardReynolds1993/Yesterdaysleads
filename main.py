@@ -16,7 +16,7 @@ print("🚀 main.py loaded — sanity build", flush=True)
 MONGO_URI = os.environ.get("MONGO_URI")
 MONGO_DB = os.environ.get("MONGO_DB", "leads")
 
-# ✅ IMPORTANT: case-sensitive collection name (your Atlas shows LeadsData)
+# ✅ IMPORTANT: your real Atlas collection is LeadsData (case-sensitive)
 MONGO_COLLECTION = os.environ.get("MONGO_COLLECTION", "LeadsData")
 
 SERVICE_NAME = os.environ.get("SERVICE_NAME", "yesterdaysleads")
@@ -30,9 +30,10 @@ if not MONGO_URI:
 # =========================
 app = FastAPI(title="Yesterday's Leads API")
 
+# CORS (safe for your simple viewer; tighten later)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -41,11 +42,13 @@ app.add_middleware(
 # =========================
 # DB
 # =========================
+# Mongo collection names ARE case-sensitive.
+# Your real DB/collection per Compass: leads -> LeadsData
 client = AsyncIOMotorClient(MONGO_URI)
 db = client[MONGO_DB]
 leads_col = db[MONGO_COLLECTION]
 
-print(f"🧠 Mongo connected → DB='{db.name}', Collection='{leads_col.name}'", flush=True)
+print(f"🧠 Mongo configured → DB='{db.name}', Collection='{leads_col.name}'", flush=True)
 
 # =========================
 # MODELS
@@ -58,33 +61,8 @@ class LeadsSearchRequest(BaseModel):
     # optional filters
     state: Optional[str] = None
     zip: Optional[str] = None
+    lead_type_norm: Optional[str] = None
 
-    # ✅ accept either (UI can send one; API will match both)
-    lead_type_code: Optional[str] = None   # FE, LIFE, VET, RET, MED, HOME, HEALTH, AUTO
-    lead_type_norm: Optional[str] = None   # final_expense, life, veteran_life, etc. (if present)
-
-
-# =========================
-# HELPERS
-# =========================
-def _id_to_str(d: Dict[str, Any]) -> Dict[str, Any]:
-    if "_id" in d:
-        d["id"] = str(d.pop("_id"))
-    return d
-
-def _norm_zip(z: str) -> str:
-    s = "".join(ch for ch in (z or "").strip() if ch.isdigit())
-    return s[:5] if len(s) >= 5 else s
-
-def _norm_state(st: str) -> str:
-    return (st or "").strip().upper()
-
-def _norm_code(code: str) -> str:
-    return (code or "").strip().upper()
-
-def _norm_norm(v: str) -> str:
-    # "Veteran Life" -> "veteran_life"
-    return (v or "").strip().lower().replace(" ", "_")
 
 # =========================
 # ROUTES
@@ -93,9 +71,11 @@ def _norm_norm(v: str) -> str:
 async def root():
     return {"ok": True, "service": SERVICE_NAME, "version": VERSION}
 
+
 @app.get("/health")
 async def health():
     return {"ok": True}
+
 
 @app.get("/__whoami")
 async def whoami():
@@ -104,108 +84,114 @@ async def whoami():
         "file": "main.py",
         "service": SERVICE_NAME,
         "version": VERSION,
-        "mongo_db": MONGO_DB,
-        "mongo_collection": MONGO_COLLECTION,
+        "mongo_db": db.name,
+        "mongo_collection": leads_col.name,
     }
+
 
 @app.get("/__mongo")
 async def __mongo():
-    return {"ok": True, "mongo_db": db.name, "mongo_collection": leads_col.name}
+    """
+    Debug endpoint to prove Render is pointing at the SAME Mongo DB/collection as Compass.
+    Open: https://yesterdaysleads.onrender.com/__mongo
+    """
+    # forces a real server selection + proves connectivity
+    try:
+        await client.admin.command("ping")
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "mongo_db": db.name,
+            "mongo_collection": leads_col.name,
+            "version": VERSION,
+        }
 
-@app.get("/__counts")
-async def __counts():
-    """
-    🔥 This tells us immediately if Render is pointed at the SAME data you see in Atlas.
-    """
     total = await leads_col.count_documents({})
-    # quick sanity samples
-    has_createdAt = await leads_col.count_documents({"createdAt": {"$exists": True}})
-    has_lead_type_code = await leads_col.count_documents({"lead_type_code": {"$exists": True}})
-    has_lead_type_norm = await leads_col.count_documents({"lead_type_norm": {"$exists": True}})
+    sample = await leads_col.find_one({})
+    if isinstance(sample, dict) and "_id" in sample:
+        sample["_id"] = str(sample["_id"])
 
     return {
         "ok": True,
         "mongo_db": db.name,
         "mongo_collection": leads_col.name,
         "total": total,
-        "has_createdAt": has_createdAt,
-        "has_lead_type_code": has_lead_type_code,
-        "has_lead_type_norm": has_lead_type_norm,
+        "sample_keys": sorted(list(sample.keys())) if isinstance(sample, dict) else [],
+        "version": VERSION,
     }
 
-@app.get("/meta/lead-types")
-async def meta_lead_types():
-    """
-    UI should load Product Types from lead_type_code (your data shows AUTO/FE/etc).
-    Returns both lists when available.
-    """
-    codes = await leads_col.distinct("lead_type_code")
-    norms = await leads_col.distinct("lead_type_norm")
-
-    codes_clean = sorted([c for c in (str(x).strip().upper() for x in codes) if c])
-    norms_clean = sorted([n for n in (str(x).strip().lower() for x in norms) if n])
-
-    return {
-        "ok": True,
-        "mongo_db": db.name,
-        "mongo_collection": leads_col.name,
-        "lead_type_code": codes_clean,
-        "lead_type_norm": norms_clean,
-    }
 
 @app.get("/leads")
 async def leads():
     """
     Absolute simplest Mongo test.
+    If this returns a sample doc, your Render deploy + Mongo collection are correct.
     """
-    total = await leads_col.count_documents({})
     doc = await leads_col.find_one({})
     if not doc:
-        return {"ok": True, "count": 0, "total": total, "mongo_db": db.name, "mongo_collection": leads_col.name}
+        return {"ok": True, "count": 0, "mongo_db": db.name, "mongo_collection": leads_col.name}
 
-    doc = _id_to_str(doc)
-    return {"ok": True, "count": 1, "total": total, "sample": doc, "mongo_db": db.name, "mongo_collection": leads_col.name}
+    doc["id"] = str(doc.pop("_id"))
+    return {"ok": True, "sample": doc, "mongo_db": db.name, "mongo_collection": leads_col.name}
+
 
 @app.post("/leads/search")
 async def leads_search(body: LeadsSearchRequest):
+    """
+    Search endpoint that matches your HTML viewer.
+
+    Expected doc fields (based on your sample):
+      - lead_age_bucket: "days_4_14" / "yesterday_72h" / etc (lowercase) [optional]
+      - sold_tiers: ["YESTERDAY_72H", ...] (uppercase) [optional]
+      - state or state2
+      - zip_code / zip5
+      - lead_type_norm (optional)
+      - status (optional)
+
+    NOTE:
+    Your current LeadsData docs (per screenshots) include:
+      - state, zip_code, lead_type_code, createdAt, tier_1..tier_5
+    So bucket logic may not filter anything yet (that's fine).
+    """
+    q: Dict[str, Any] = {}
     and_clauses: List[Dict[str, Any]] = []
 
-    # Bucket (optional)
-    bucket_raw = (body.bucket or "").strip()
-    if bucket_raw and bucket_raw.upper() != "ALL":
-        b_up = bucket_raw.upper()
-        b_low = bucket_raw.lower()
-        and_clauses.append(
-            {"$or": [
+    # Bucket handling (support BOTH sold_tiers and lead_age_bucket)
+    if body.bucket and body.bucket.strip().upper() != "ALL":
+        b_up = body.bucket.strip().upper()
+        b_low = body.bucket.strip().lower()
+        and_clauses.append({
+            "$or": [
                 {"sold_tiers": b_up},
                 {"lead_age_bucket": b_low},
                 {"lead_age_bucket": b_low.replace("_", "-")},
-            ]}
-        )
+            ]
+        })
 
-    # State
     if body.state:
-        st = _norm_state(body.state)
+        st = body.state.strip().upper()
         and_clauses.append({"$or": [{"state": st}, {"state2": st}]})
 
-    # ZIP
     if body.zip:
-        z = _norm_zip(body.zip)
+        z = "".join(ch for ch in body.zip.strip() if ch.isdigit())
+        if len(z) >= 5:
+            z = z[:5]
         if z:
-            and_clauses.append({"$or": [{"zip5": z}, {"zip_code": z}]})
+            # zip_code in your docs is sometimes numeric; we match both string/number safely via $in
+            and_clauses.append({
+                "$or": [
+                    {"zip5": z},
+                    {"zip_code": z},
+                    {"zip_code": int(z)} if z.isdigit() else {"zip_code": z},
+                ]
+            })
 
-    # ✅ Lead type: support BOTH fields
-    lt_code = _norm_code(body.lead_type_code) if body.lead_type_code else ""
-    lt_norm = _norm_norm(body.lead_type_norm) if body.lead_type_norm else ""
+    if body.lead_type_norm:
+        # You may not have lead_type_norm in this dataset; leaving this for later.
+        lt = body.lead_type_norm.strip().lower()
+        and_clauses.append({"lead_type_norm": lt})
 
-    if lt_code and lt_norm:
-        and_clauses.append({"$or": [{"lead_type_code": lt_code}, {"lead_type_norm": lt_norm}]})
-    elif lt_code:
-        and_clauses.append({"lead_type_code": lt_code})
-    elif lt_norm:
-        and_clauses.append({"lead_type_norm": lt_norm})
-
-    q: Dict[str, Any] = {}
     if and_clauses:
         q = {"$and": and_clauses} if len(and_clauses) > 1 else and_clauses[0]
 
@@ -214,15 +200,18 @@ async def leads_search(body: LeadsSearchRequest):
     limit = int(body.limit)
     skip = (page - 1) * limit
 
-    # Sort newest first
-    sort = [("submittedAt", -1), ("createdAt", -1)]
+    # Sort newest first (your docs have createdAt)
+    sort = [("createdAt", -1)]
 
-    docs = await leads_col.find(q).sort(sort).skip(skip).limit(limit).to_list(length=limit)
+    cursor = leads_col.find(q).sort(sort).skip(skip).limit(limit)
+    docs = await cursor.to_list(length=limit)
+
     total = await leads_col.count_documents(q)
 
     items: List[Dict[str, Any]] = []
     for d in docs:
-        items.append(_id_to_str(d))
+        d["id"] = str(d.pop("_id"))
+        items.append(d)
 
     return {
         "ok": True,
@@ -230,8 +219,9 @@ async def leads_search(body: LeadsSearchRequest):
         "limit": limit,
         "total": total,
         "items": items,
-        "bucket": bucket_raw.upper() if bucket_raw else "ALL",
+        "bucket": body.bucket.strip().upper() if body.bucket else "ALL",
         "query": q,
         "mongo_db": db.name,
         "mongo_collection": leads_col.name,
+        "version": VERSION,
     }
