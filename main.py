@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import json
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI
@@ -8,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 
-print("🚀 main.py loaded — BOOST RANK build", flush=True)
+print("🚀 main.py loaded — pricing+bucket from createdAt", flush=True)
 
 # =========================
 # CONFIG
@@ -20,10 +22,78 @@ MONGO_DB = os.environ.get("MONGO_DB", "leads")
 MONGO_COLLECTION = os.environ.get("MONGO_COLLECTION", "LeadsData")
 
 SERVICE_NAME = os.environ.get("SERVICE_NAME", "yesterdaysleads")
-VERSION = os.environ.get("VERSION", "v2026-02-04-BOOST")
+VERSION = os.environ.get("VERSION", "v2026-02-04-createdAt-price")
 
 if not MONGO_URI:
     raise RuntimeError("Missing env var MONGO_URI")
+
+# =========================
+# PRICING (Lead Type x Age Bucket) — matches your Sheet
+# =========================
+# Buckets:
+# - YESTERDAY_72H
+# - DAYS_4_14
+# - DAYS_15_30
+# - DAYS_31_90
+# - DAYS_91_PLUS
+#
+# Lead Type keys (internal):
+# - final_expense, life, veteran_life, home, auto, medicare, health, retirement
+DEFAULT_PRICING: Dict[str, Dict[str, float]] = {
+    "final_expense": {
+        "YESTERDAY_72H": 15.00, "DAYS_4_14": 10.00, "DAYS_15_30": 7.50, "DAYS_31_90": 5.00, "DAYS_91_PLUS": 2.50,
+        "CABOOM_RETAIL": 25.00
+    },
+    "life": {
+        "YESTERDAY_72H": 21.00, "DAYS_4_14": 14.00, "DAYS_15_30": 10.00, "DAYS_31_90": 7.00, "DAYS_91_PLUS": 3.50,
+        "CABOOM_RETAIL": 35.00
+    },
+    "veteran_life": {
+        "YESTERDAY_72H": 14.00, "DAYS_4_14": 9.00, "DAYS_15_30": 7.00, "DAYS_31_90": 4.00, "DAYS_91_PLUS": 2.00,
+        "CABOOM_RETAIL": 23.00
+    },
+    "home": {
+        "YESTERDAY_72H": 16.00, "DAYS_4_14": 11.00, "DAYS_15_30": 8.00, "DAYS_31_90": 5.50, "DAYS_91_PLUS": 3.00,
+        "CABOOM_RETAIL": 27.00
+    },
+    "auto": {
+        "YESTERDAY_72H": 16.00, "DAYS_4_14": 11.00, "DAYS_15_30": 8.00, "DAYS_31_90": 5.50, "DAYS_91_PLUS": 3.00,
+        "CABOOM_RETAIL": 27.00
+    },
+    "medicare": {
+        "YESTERDAY_72H": 15.00, "DAYS_4_14": 10.00, "DAYS_15_30": 7.50, "DAYS_31_90": 5.00, "DAYS_91_PLUS": 2.50,
+        "CABOOM_RETAIL": 25.00
+    },
+    "health": {
+        "YESTERDAY_72H": 16.00, "DAYS_4_14": 11.00, "DAYS_15_30": 8.00, "DAYS_31_90": 5.50, "DAYS_91_PLUS": 3.00,
+        "CABOOM_RETAIL": 27.00
+    },
+    "retirement": {
+        "YESTERDAY_72H": 29.00, "DAYS_4_14": 19.00, "DAYS_15_30": 14.00, "DAYS_31_90": 9.00, "DAYS_91_PLUS": 4.50,
+        "CABOOM_RETAIL": 50.00
+    },
+}
+
+def load_pricing() -> Dict[str, Dict[str, float]]:
+    raw = os.environ.get("PRICING_JSON")
+    if not raw:
+        return DEFAULT_PRICING
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            out: Dict[str, Dict[str, float]] = {}
+            for k, v in data.items():
+                if isinstance(v, dict):
+                    out[str(k).strip().lower()] = {
+                        str(bucket).strip().upper(): float(price)
+                        for bucket, price in v.items()
+                    }
+            return out or DEFAULT_PRICING
+    except Exception:
+        pass
+    return DEFAULT_PRICING
+
+PRICING = load_pricing()
 
 # =========================
 # APP
@@ -32,7 +102,7 @@ app = FastAPI(title="Yesterday's Leads API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # viewer-friendly; tighten later
+    allow_origins=["*"],  # tighten later
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,82 +114,203 @@ app.add_middleware(
 client = AsyncIOMotorClient(MONGO_URI)
 db = client[MONGO_DB]
 leads_col = db[MONGO_COLLECTION]
-
 print(f"🧠 Mongo configured → DB='{db.name}', Collection='{leads_col.name}'", flush=True)
+
+# =========================
+# MODELS
+# =========================
+class LeadsSearchRequest(BaseModel):
+    bucket: str = Field(default="ALL")  # ALL or YESTERDAY_72H, DAYS_4_14, etc.
+    page: int = Field(default=1, ge=1)
+    limit: int = Field(default=25, ge=1, le=200)
+
+    # optional filters
+    state: Optional[str] = None
+    zip: Optional[str] = None
+    lead_type_norm: Optional[str] = None
+    lead_type_code: Optional[str] = None  # FE/LIFE/VET/HOME/AUTO/MED/HEALTH/RET (optional)
+
 
 # =========================
 # HELPERS
 # =========================
-def _s(v: Optional[str]) -> str:
-    return (str(v).strip() if v is not None else "")
+def mongo_id_to_str(d: Dict[str, Any]) -> Dict[str, Any]:
+    if "_id" in d:
+        d["id"] = str(d.pop("_id"))
+    return d
 
-def _zip5(v: Optional[str]) -> str:
-    z = "".join(ch for ch in _s(v) if ch.isdigit())
+def norm_zip(v: str) -> str:
+    z = "".join(ch for ch in (v or "").strip() if ch.isdigit())
     return z[:5] if len(z) >= 5 else z
 
-def _upper(v: Optional[str]) -> str:
-    return _s(v).upper()
+def norm_state(v: str) -> str:
+    return (v or "").strip().upper()
 
-def _bucket_up(v: Optional[str]) -> str:
-    b = _s(v)
+def norm_bucket(v: str) -> str:
+    b = (v or "").strip()
     if not b:
         return "ALL"
     b = b.upper()
     aliases = {
         "YESTERDAY_72": "YESTERDAY_72H",
         "YESTERDAY": "YESTERDAY_72H",
+        "YESTERDAY_72H": "YESTERDAY_72H",
         "4_14": "DAYS_4_14",
+        "DAYS_4_14": "DAYS_4_14",
         "15_30": "DAYS_15_30",
+        "DAYS_15_30": "DAYS_15_30",
         "31_90": "DAYS_31_90",
+        "DAYS_31_90": "DAYS_31_90",
         "91_PLUS": "DAYS_91_PLUS",
-        "91+": "DAYS_91_PLUS",
+        "DAYS_91_PLUS": "DAYS_91_PLUS",
     }
     return aliases.get(b, b)
 
-def _bucket_low_forms(b_up: str) -> List[str]:
-    b = b_up.lower()
-    return list({b, b.replace("-", "_"), b.replace("_", "-")})
+# Map canonical lead_type_code -> pricing key
+CODE_TO_KEY = {
+    "FE": "final_expense",
+    "LIFE": "life",
+    "VET": "veteran_life",
+    "HOME": "home",
+    "AUTO": "auto",
+    "MED": "medicare",
+    "HEALTH": "health",
+    "RET": "retirement",
+}
 
-def _is_allish(v: Optional[str]) -> bool:
-    s = _s(v).lower()
-    return s in {"", "all", "any", "none", "null", "undefined", "all states", "all ages", "all types"}
-
-def _mongo_id_to_str(d: Dict[str, Any]) -> Dict[str, Any]:
-    if "_id" in d:
-        d["id"] = str(d.pop("_id"))
-    return d
-
-def _clean_type_norm(v: Optional[str]) -> str:
+def norm_type_key_from_doc(d: Dict[str, Any]) -> Optional[str]:
     """
-    UI may send:
-      - "final_expense"
-      - "Final Expense"
-      - "FE"
-    DB may have:
-      - lead_type_norm like "Final Expense" OR "final_expense"
-      - lead_type_code like "FE"
-    We handle both.
+    Prefer lead_type_code (FE/LIFE/...) because it's canonical.
+    Fallback to lead_type_norm if code missing.
     """
-    s = _s(v)
-    if not s:
-        return ""
-    return s.strip()
+    code = (d.get("lead_type_code") or "").strip().upper()
+    if code and code in CODE_TO_KEY:
+        return CODE_TO_KEY[code]
 
-# =========================
-# MODELS
-# =========================
-class LeadsSearchRequest(BaseModel):
-    # These are BOOST inputs now (they do not hard-filter inventory)
-    bucket: str = Field(default="ALL")     # ALL or YESTERDAY_72H, DAYS_4_14, etc.
-    page: int = Field(default=1, ge=1)
-    limit: int = Field(default=25, ge=1, le=200)
+    # fallback lead_type_norm -> pricing key
+    # allow: "Final Expense", "final_expense", "Veteran Life", "veteran_life"
+    ln = (d.get("lead_type_norm") or "").strip().lower()
+    if not ln:
+        return None
+    ln = ln.replace(" ", "_")
+    # normalize some common variations
+    if ln in ("veteran", "vet", "veteranlife", "veteran_life"):
+        return "veteran_life"
+    if ln in ("finalexpense", "final_expense"):
+        return "final_expense"
+    if ln in ("med", "medicare"):
+        return "medicare"
+    if ln in ("ret", "retirement"):
+        return "retirement"
+    if ln in PRICING:
+        return ln
+    return None
 
-    state: Optional[str] = None           # "AL"
-    zip: Optional[str] = None             # "70607"
-    lead_type_norm: Optional[str] = None  # "final_expense" OR "Final Expense" etc.
+def parse_dt(v: Any) -> Optional[datetime]:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        dt = v
+    elif isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            # supports "2026-01-30T00:00:00.000+00:00" and "2026-01-30"
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    else:
+        return None
 
-    # Optional toggle if you want: only show Available
-    only_available: bool = Field(default=False)
+    # make tz-aware (assume UTC if naive)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+def bucket_from_created_at(created_at: Optional[datetime]) -> Optional[str]:
+    if not created_at:
+        return None
+    now = datetime.now(timezone.utc)
+    age_days = (now - created_at).total_seconds() / 86400.0
+
+    if age_days < 0:
+        # clock skew / future date
+        return "YESTERDAY_72H"
+
+    if age_days <= 3.0:
+        return "YESTERDAY_72H"
+    if 4.0 <= age_days <= 14.0:
+        return "DAYS_4_14"
+    if 15.0 <= age_days <= 30.0:
+        return "DAYS_15_30"
+    if 31.0 <= age_days <= 90.0:
+        return "DAYS_31_90"
+    if age_days >= 91.0:
+        return "DAYS_91_PLUS"
+    # gap (3-4, 14-15 etc) — push to nearest sensible tier
+    if age_days < 4.0:
+        return "YESTERDAY_72H"
+    if age_days < 15.0:
+        return "DAYS_4_14"
+    if age_days < 31.0:
+        return "DAYS_15_30"
+    if age_days < 91.0:
+        return "DAYS_31_90"
+    return "DAYS_91_PLUS"
+
+def price_for(type_key: Optional[str], bucket: Optional[str]) -> Optional[float]:
+    if not type_key or not bucket:
+        return None
+    m = PRICING.get(type_key)
+    if not m:
+        return None
+    return m.get(bucket)
+
+def caboom_retail_for(type_key: Optional[str]) -> Optional[float]:
+    if not type_key:
+        return None
+    m = PRICING.get(type_key)
+    if not m:
+        return None
+    return m.get("CABOOM_RETAIL")
+
+def bucket_range_query(bucket_up: str) -> Optional[Dict[str, Any]]:
+    """
+    Build a Mongo query that filters by createdAt/created_at range.
+    """
+    b = norm_bucket(bucket_up)
+    if b == "ALL":
+        return None
+
+    now = datetime.now(timezone.utc)
+
+    def or_created(range_q: Dict[str, Any]) -> Dict[str, Any]:
+        # apply to either field if your data has both styles
+        return {"$or": [{"createdAt": range_q}, {"created_at": range_q}]}
+
+    if b == "YESTERDAY_72H":
+        start = now - timedelta(hours=72)
+        return or_created({"$gte": start})
+    if b == "DAYS_4_14":
+        # between 14 and 4 days ago
+        older = now - timedelta(days=4)
+        newer = now - timedelta(days=14)
+        return or_created({"$lte": older, "$gte": newer})
+    if b == "DAYS_15_30":
+        older = now - timedelta(days=15)
+        newer = now - timedelta(days=30)
+        return or_created({"$lte": older, "$gte": newer})
+    if b == "DAYS_31_90":
+        older = now - timedelta(days=31)
+        newer = now - timedelta(days=90)
+        return or_created({"$lte": older, "$gte": newer})
+    if b == "DAYS_91_PLUS":
+        cutoff = now - timedelta(days=91)
+        return or_created({"$lte": cutoff})
+
+    return None
+
 
 # =========================
 # ROUTES
@@ -145,24 +336,15 @@ async def whoami():
 
 @app.get("/__mongo")
 async def __mongo():
-    """
-    Proves Render is pointing at the same DB/collection you expect.
-    """
     try:
         await client.admin.command("ping")
     except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e),
-            "mongo_db": db.name,
-            "mongo_collection": leads_col.name,
-            "version": VERSION,
-        }
+        return {"ok": False, "error": str(e), "mongo_db": db.name, "mongo_collection": leads_col.name, "version": VERSION}
 
     total = await leads_col.count_documents({})
     sample = await leads_col.find_one({})
-    if isinstance(sample, dict):
-        sample = {k: (str(v) if k == "_id" else v) for k, v in sample.items()}
+    if isinstance(sample, dict) and "_id" in sample:
+        sample["_id"] = str(sample["_id"])
 
     return {
         "ok": True,
@@ -173,186 +355,119 @@ async def __mongo():
         "version": VERSION,
     }
 
-@app.get("/leads")
-async def leads():
-    """
-    Simplest Mongo test: returns 1 sample lead.
-    """
-    doc = await leads_col.find_one({})
-    if not doc:
-        return {"ok": True, "count": 0, "mongo_db": db.name, "mongo_collection": leads_col.name}
-    doc = _mongo_id_to_str(doc)
-    return {"ok": True, "sample": doc, "mongo_db": db.name, "mongo_collection": leads_col.name}
-
-# ---- META for UI dropdowns ----
-@app.get("/meta/states")
-async def meta_states():
-    # state may live in state or state2 depending on dataset
-    s1 = await leads_col.distinct("state")
-    s2 = await leads_col.distinct("state2")
-    all_states = set()
-
-    for x in (s1 or []):
-        v = _upper(x)
-        if v and v != "UNKNOWN":
-            all_states.add(v)
-    for x in (s2 or []):
-        v = _upper(x)
-        if v and v != "UNKNOWN":
-            all_states.add(v)
-
-    out = sorted(all_states)
-    return {"ok": True, "states": out, "count": len(out), "version": VERSION}
+@app.get("/pricing")
+async def pricing():
+    return {"ok": True, "pricing": PRICING, "version": VERSION}
 
 @app.get("/meta/lead-types")
 async def meta_lead_types():
     norms = await leads_col.distinct("lead_type_norm")
     codes = await leads_col.distinct("lead_type_code")
 
-    norms_clean = sorted({str(x).strip() for x in (norms or []) if x is not None and str(x).strip() and str(x).strip().lower() != "unknown"})
-    codes_clean = sorted({str(x).strip().upper() for x in (codes or []) if x is not None and str(x).strip() and str(x).strip().lower() != "unknown"})
+    norms_clean = sorted({str(s).strip() for s in norms if s is not None and str(s).strip() and str(s).strip().lower() != "unknown"})
+    codes_clean = sorted({str(s).strip().upper() for s in codes if s is not None and str(s).strip() and str(s).strip().lower() != "unknown"})
 
-    return {
-        "ok": True,
-        "lead_type_norm": norms_clean,
-        "lead_type_code": codes_clean,
-        "version": VERSION,
-    }
+    return {"ok": True, "lead_type_norm": norms_clean, "lead_type_code": codes_clean, "version": VERSION}
 
-# =========================
-# SEARCH (BOOST RANK)
-# =========================
+@app.get("/leads")
+async def leads():
+    doc = await leads_col.find_one({})
+    if not doc:
+        return {"ok": True, "count": 0, "mongo_db": db.name, "mongo_collection": leads_col.name}
+
+    doc = mongo_id_to_str(doc)
+    return {"ok": True, "sample": doc, "mongo_db": db.name, "mongo_collection": leads_col.name}
+
 @app.post("/leads/search")
 async def leads_search(body: LeadsSearchRequest):
     """
-    Inventory ALWAYS shows.
-    Controls only BOOST what appears at the top.
-
-    Boost scoring (tweak any time):
-      +100: lead type matches (norm or code)
-      +60 : state matches (state/state2)
-      +40 : zip matches (zip5/zip_code)
-      +30 : bucket matches (sold_tiers or lead_age_bucket)
+    Key behavior:
+    - Derive bucket from createdAt (fallback created_at) per-lead
+    - Derive type via lead_type_code (fallback lead_type_norm)
+    - Compute price = PRICING[type_key][bucket]
     """
+    and_clauses: List[Dict[str, Any]] = []
+
+    # ---- bucket filter (optional) ----
+    bucket_up = norm_bucket(body.bucket)
+    brq = bucket_range_query(bucket_up)
+    if brq:
+        and_clauses.append(brq)
+
+    # ---- state filter ----
+    if body.state and str(body.state).strip():
+        st = norm_state(body.state)
+        # ignore "All States"
+        if st not in ("ALL STATES", "ALL", "ANY"):
+            and_clauses.append({"$or": [{"state": st}, {"state2": st}]})
+
+    # ---- zip filter ----
+    if body.zip and str(body.zip).strip():
+        z = norm_zip(body.zip)
+        if z:
+            # zip_code might be stored as int in some imports
+            or_zip: List[Dict[str, Any]] = [{"zip5": z}, {"zip_code": z}]
+            if z.isdigit():
+                or_zip.append({"zip_code": int(z)})
+            and_clauses.append({"$or": or_zip})
+
+    # ---- lead type filter (code preferred) ----
+    if body.lead_type_code and str(body.lead_type_code).strip():
+        code = str(body.lead_type_code).strip().upper()
+        if code in CODE_TO_KEY:
+            and_clauses.append({"lead_type_code": code})
+
+    elif body.lead_type_norm and str(body.lead_type_norm).strip():
+        lt = str(body.lead_type_norm).strip()
+        # case-insensitive exact match
+        and_clauses.append({"lead_type_norm": {"$regex": f"^{lt}$", "$options": "i"}})
+
+    # Final query
+    if not and_clauses:
+        q: Dict[str, Any] = {}
+    elif len(and_clauses) == 1:
+        q = and_clauses[0]
+    else:
+        q = {"$and": and_clauses}
+
+    # Pagination
     page = int(body.page)
     limit = int(body.limit)
     skip = (page - 1) * limit
 
-    # ---- BOOST inputs (do not filter inventory) ----
-    boost_state = "" if _is_allish(body.state) else _upper(body.state)
-    boost_zip = "" if _is_allish(body.zip) else _zip5(body.zip)
-    boost_bucket = _bucket_up(body.bucket)
-    boost_type_raw = "" if _is_allish(body.lead_type_norm) else _clean_type_norm(body.lead_type_norm)
+    # Sort newest first (createdAt preferred)
+    sort = [("createdAt", -1), ("created_at", -1), ("_id", -1)]
 
-    # allow type boost via:
-    # - lead_type_code exact like "FE"
-    # - lead_type_norm case-insensitive exact like "Final Expense"
-    # - lead_type_norm underscore style like "final_expense"
-    boost_type_code = boost_type_raw.strip().upper()
-    boost_type_norm_exact = boost_type_raw.strip()
-    boost_type_norm_underscored = boost_type_raw.strip().lower().replace(" ", "_")
-
-    # ---- base match (optional) ----
-    match: Dict[str, Any] = {}
-    if body.only_available:
-        match = {"status": "Available"}
-
-    # ---- total inventory (for UI) ----
-    total = await leads_col.count_documents(match)
-
-    # ---- compute boost_score in pipeline ----
-    score_parts: List[Dict[str, Any]] = []
-
-    # Lead Type boost (code OR norm exact OR norm underscored)
-    if boost_type_raw:
-        score_parts.append({
-            "$cond": [
-                {
-                    "$or": [
-                        {"$eq": ["$lead_type_code", boost_type_code]},
-                        {"$regexMatch": {"input": {"$toString": "$lead_type_norm"}, "regex": f"^{boost_type_norm_exact}$", "options": "i"}},
-                        {"$regexMatch": {"input": {"$toString": "$lead_type_norm"}, "regex": f"^{boost_type_norm_underscored}$", "options": "i"}},
-                    ]
-                },
-                100,
-                0
-            ]
-        })
-
-    # State boost (state or state2)
-    if boost_state:
-        score_parts.append({
-            "$cond": [
-                {"$or": [{"$eq": ["$state", boost_state]}, {"$eq": ["$state2", boost_state]}]},
-                60,
-                0
-            ]
-        })
-
-    # ZIP boost (zip5 or zip_code string/int)
-    if boost_zip:
-        score_parts.append({
-            "$cond": [
-                {
-                    "$or": [
-                        {"$eq": ["$zip5", boost_zip]},
-                        {"$eq": [{"$toString": "$zip_code"}, boost_zip]},
-                    ]
-                },
-                40,
-                0
-            ]
-        })
-
-    # Bucket boost (sold_tiers contains bucket OR lead_age_bucket matches any lower form)
-    if boost_bucket and boost_bucket != "ALL":
-        low_forms = _bucket_low_forms(boost_bucket)
-        score_parts.append({
-            "$cond": [
-                {
-                    "$or": [
-                        {"$in": [boost_bucket, {"$ifNull": ["$sold_tiers", []]}]},
-                        {"$in": ["$lead_age_bucket", low_forms]},
-                    ]
-                },
-                30,
-                0
-            ]
-        })
-
-    if not score_parts:
-        score_expr: Any = 0
-    else:
-        score_expr = {"$add": score_parts}
-
-    pipeline: List[Dict[str, Any]] = [
-        {"$match": match},
-        {"$addFields": {"boost_score": score_expr}},
-        # newest first after boost; createdAt is your real field
-        {"$sort": {"boost_score": -1, "createdAt": -1, "_id": -1}},
-        {"$skip": skip},
-        {"$limit": limit},
-    ]
-
-    docs = await leads_col.aggregate(pipeline).to_list(length=limit)
+    cursor = leads_col.find(q).sort(sort).skip(skip).limit(limit)
+    docs = await cursor.to_list(length=limit)
+    total = await leads_col.count_documents(q)
 
     items: List[Dict[str, Any]] = []
     for d in docs:
-        d = _mongo_id_to_str(d)
+        d = mongo_id_to_str(d)
+
+        created = parse_dt(d.get("createdAt")) or parse_dt(d.get("created_at"))
+        bucket = bucket_from_created_at(created)
+
+        type_key = norm_type_key_from_doc(d)
+
+        d["age_bucket"] = bucket  # ✅ UI can display this
+        d["price"] = price_for(type_key, bucket)  # ✅ ALWAYS computed from createdAt+type
+        d["caboom_retail"] = caboom_retail_for(type_key)
+
+        # helpful debug fields (keep or remove later)
+        d["type_key"] = type_key
+
         items.append(d)
 
     return {
         "ok": True,
         "page": page,
         "limit": limit,
-        "total": total,            # total inventory
+        "total": total,
+        "bucket_filter": bucket_up,
         "items": items,
-        "boost": {
-            "lead_type": boost_type_raw,
-            "state": boost_state,
-            "zip": boost_zip,
-            "bucket": boost_bucket,
-        },
+        "query": q,
         "mongo_db": db.name,
         "mongo_collection": leads_col.name,
         "version": VERSION,
