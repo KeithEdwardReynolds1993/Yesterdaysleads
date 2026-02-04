@@ -43,9 +43,22 @@ app.add_middleware(
 # =========================
 # DB
 # =========================
+if not MONGO_URI:
+    raise RuntimeError("Missing env var MONGO_URI")
+
+# IMPORTANT:
+# Mongo collection names ARE case-sensitive.
+# Your real collection is: LeadsData
 client = AsyncIOMotorClient(MONGO_URI)
-db = client[MONGO_DB]
-leads_col = db[MONGO_COLLECTION]  # ✅ should be LeadsData now
+
+db = client[os.environ.get("MONGO_DB", "leads")]
+
+leads_col = db[os.environ.get("MONGO_COLLECTION", "LeadsData")]
+
+print(
+    f"🧠 Mongo connected → DB='{db.name}', Collection='{leads_col.name}'",
+    flush=True
+)
 
 
 # =========================
