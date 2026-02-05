@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 
-print("🚀 main.py loaded — pricing+bucket from createdAt", flush=True)
+print("🚀 main.py loaded — pricing+bucket from createdAt (BOOST-only bucket)", flush=True)
 
 # =========================
 # CONFIG
@@ -22,7 +22,7 @@ MONGO_DB = os.environ.get("MONGO_DB", "leads")
 MONGO_COLLECTION = os.environ.get("MONGO_COLLECTION", "LeadsData")
 
 SERVICE_NAME = os.environ.get("SERVICE_NAME", "yesterdaysleads")
-VERSION = os.environ.get("VERSION", "v2026-02-04-createdAt-price")
+VERSION = os.environ.get("VERSION", "v2026-02-05-boost-only")
 
 if not MONGO_URI:
     raise RuntimeError("Missing env var MONGO_URI")
@@ -30,15 +30,6 @@ if not MONGO_URI:
 # =========================
 # PRICING (Lead Type x Age Bucket) — matches your Sheet
 # =========================
-# Buckets:
-# - YESTERDAY_72H
-# - DAYS_4_14
-# - DAYS_15_30
-# - DAYS_31_90
-# - DAYS_91_PLUS
-#
-# Lead Type keys (internal):
-# - final_expense, life, veteran_life, home, auto, medicare, health, retirement
 DEFAULT_PRICING: Dict[str, Dict[str, float]] = {
     "final_expense": {
         "YESTERDAY_72H": 15.00, "DAYS_4_14": 10.00, "DAYS_15_30": 7.50, "DAYS_31_90": 5.00, "DAYS_91_PLUS": 2.50,
@@ -120,7 +111,7 @@ print(f"🧠 Mongo configured → DB='{db.name}', Collection='{leads_col.name}'"
 # MODELS
 # =========================
 class LeadsSearchRequest(BaseModel):
-    bucket: str = Field(default="ALL")  # ALL or YESTERDAY_72H, DAYS_4_14, etc.
+    bucket: str = Field(default="ALL")  # ALL or YESTERDAY_72H, DAYS_4_14, etc. (BOOST ONLY)
     page: int = Field(default=1, ge=1)
     limit: int = Field(default=25, ge=1, le=200)
 
@@ -163,6 +154,7 @@ def norm_bucket(v: str) -> str:
         "DAYS_31_90": "DAYS_31_90",
         "91_PLUS": "DAYS_91_PLUS",
         "DAYS_91_PLUS": "DAYS_91_PLUS",
+        "ALL": "ALL",
     }
     return aliases.get(b, b)
 
@@ -187,13 +179,10 @@ def norm_type_key_from_doc(d: Dict[str, Any]) -> Optional[str]:
     if code and code in CODE_TO_KEY:
         return CODE_TO_KEY[code]
 
-    # fallback lead_type_norm -> pricing key
-    # allow: "Final Expense", "final_expense", "Veteran Life", "veteran_life"
     ln = (d.get("lead_type_norm") or "").strip().lower()
     if not ln:
         return None
     ln = ln.replace(" ", "_")
-    # normalize some common variations
     if ln in ("veteran", "vet", "veteranlife", "veteran_life"):
         return "veteran_life"
     if ln in ("finalexpense", "final_expense"):
@@ -216,14 +205,12 @@ def parse_dt(v: Any) -> Optional[datetime]:
         if not s:
             return None
         try:
-            # supports "2026-01-30T00:00:00.000+00:00" and "2026-01-30"
             dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
         except Exception:
             return None
     else:
         return None
 
-    # make tz-aware (assume UTC if naive)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
@@ -235,9 +222,7 @@ def bucket_from_created_at(created_at: Optional[datetime]) -> Optional[str]:
     age_days = (now - created_at).total_seconds() / 86400.0
 
     if age_days < 0:
-        # clock skew / future date
         return "YESTERDAY_72H"
-
     if age_days <= 3.0:
         return "YESTERDAY_72H"
     if 4.0 <= age_days <= 14.0:
@@ -248,7 +233,7 @@ def bucket_from_created_at(created_at: Optional[datetime]) -> Optional[str]:
         return "DAYS_31_90"
     if age_days >= 91.0:
         return "DAYS_91_PLUS"
-    # gap (3-4, 14-15 etc) — push to nearest sensible tier
+
     if age_days < 4.0:
         return "YESTERDAY_72H"
     if age_days < 15.0:
@@ -275,9 +260,10 @@ def caboom_retail_for(type_key: Optional[str]) -> Optional[float]:
         return None
     return m.get("CABOOM_RETAIL")
 
-def bucket_range_query(bucket_up: str) -> Optional[Dict[str, Any]]:
+def preferred_bucket_bounds(bucket_up: str) -> Optional[Dict[str, datetime]]:
     """
-    Build a Mongo query that filters by createdAt/created_at range.
+    Returns inclusive bounds for createdAt for the preferred bucket.
+    Used ONLY for ranking/boosting (not filtering).
     """
     b = norm_bucket(bucket_up)
     if b == "ALL":
@@ -285,29 +271,16 @@ def bucket_range_query(bucket_up: str) -> Optional[Dict[str, Any]]:
 
     now = datetime.now(timezone.utc)
 
-    def or_created(range_q: Dict[str, Any]) -> Dict[str, Any]:
-        # apply to either field if your data has both styles
-        return {"$or": [{"createdAt": range_q}, {"created_at": range_q}]}
-
     if b == "YESTERDAY_72H":
-        start = now - timedelta(hours=72)
-        return or_created({"$gte": start})
+        return {"start": now - timedelta(hours=72), "end": now + timedelta(days=3650)}  # open-ended future-safe
     if b == "DAYS_4_14":
-        # between 14 and 4 days ago
-        older = now - timedelta(days=4)
-        newer = now - timedelta(days=14)
-        return or_created({"$lte": older, "$gte": newer})
+        return {"start": now - timedelta(days=14), "end": now - timedelta(days=4)}
     if b == "DAYS_15_30":
-        older = now - timedelta(days=15)
-        newer = now - timedelta(days=30)
-        return or_created({"$lte": older, "$gte": newer})
+        return {"start": now - timedelta(days=30), "end": now - timedelta(days=15)}
     if b == "DAYS_31_90":
-        older = now - timedelta(days=31)
-        newer = now - timedelta(days=90)
-        return or_created({"$lte": older, "$gte": newer})
+        return {"start": now - timedelta(days=90), "end": now - timedelta(days=31)}
     if b == "DAYS_91_PLUS":
-        cutoff = now - timedelta(days=91)
-        return or_created({"$lte": cutoff})
+        return {"start": datetime(1970, 1, 1, tzinfo=timezone.utc), "end": now - timedelta(days=91)}
 
     return None
 
@@ -382,22 +355,18 @@ async def leads():
 async def leads_search(body: LeadsSearchRequest):
     """
     Key behavior:
-    - Derive bucket from createdAt (fallback created_at) per-lead
-    - Derive type via lead_type_code (fallback lead_type_norm)
-    - Compute price = PRICING[type_key][bucket]
+    - Inventory is NOT filtered by bucket (bucket is BOOST ONLY)
+    - Sort boosts the preferred bucket to the top
+    - Price is still computed per lead from its own createdAt-derived age_bucket
     """
     and_clauses: List[Dict[str, Any]] = []
 
-    # ---- bucket filter (optional) ----
-    bucket_up = norm_bucket(body.bucket)
-    brq = bucket_range_query(bucket_up)
-    if brq:
-        and_clauses.append(brq)
+    # ---- bucket preference (BOOST ONLY) ----
+    bucket_pref = norm_bucket(body.bucket)
 
     # ---- state filter ----
     if body.state and str(body.state).strip():
         st = norm_state(body.state)
-        # ignore "All States"
         if st not in ("ALL STATES", "ALL", "ANY"):
             and_clauses.append({"$or": [{"state": st}, {"state2": st}]})
 
@@ -405,7 +374,6 @@ async def leads_search(body: LeadsSearchRequest):
     if body.zip and str(body.zip).strip():
         z = norm_zip(body.zip)
         if z:
-            # zip_code might be stored as int in some imports
             or_zip: List[Dict[str, Any]] = [{"zip5": z}, {"zip_code": z}]
             if z.isdigit():
                 or_zip.append({"zip_code": int(z)})
@@ -419,10 +387,9 @@ async def leads_search(body: LeadsSearchRequest):
 
     elif body.lead_type_norm and str(body.lead_type_norm).strip():
         lt = str(body.lead_type_norm).strip()
-        # case-insensitive exact match
         and_clauses.append({"lead_type_norm": {"$regex": f"^{lt}$", "$options": "i"}})
 
-    # Final query
+    # Final match query (NO bucket filtering here)
     if not and_clauses:
         q: Dict[str, Any] = {}
     elif len(and_clauses) == 1:
@@ -435,12 +402,46 @@ async def leads_search(body: LeadsSearchRequest):
     limit = int(body.limit)
     skip = (page - 1) * limit
 
-    # Sort newest first (createdAt preferred)
-    sort = [("createdAt", -1), ("created_at", -1), ("_id", -1)]
-
-    cursor = leads_col.find(q).sort(sort).skip(skip).limit(limit)
-    docs = await cursor.to_list(length=limit)
     total = await leads_col.count_documents(q)
+
+    # ---- BOOST SORTING IN MONGO (without filtering inventory) ----
+    # Choose createdAt effective field in pipeline: createdEff = ifNull(createdAt, created_at)
+    bounds = preferred_bucket_bounds(bucket_pref)
+
+    pipeline: List[Dict[str, Any]] = [
+        {"$match": q},
+        {"$addFields": {"createdEff": {"$ifNull": ["$createdAt", "$created_at"]}}},
+    ]
+
+    if bounds and bucket_pref != "ALL":
+        # inPref = createdEff between [start, end] (inclusive)
+        pipeline.append({
+            "$addFields": {
+                "inPref": {
+                    "$cond": [
+                        {
+                            "$and": [
+                                {"$ne": ["$createdEff", None]},
+                                {"$gte": ["$createdEff", bounds["start"]]},
+                                {"$lte": ["$createdEff", bounds["end"]]},
+                            ]
+                        },
+                        1,
+                        0
+                    ]
+                }
+            }
+        })
+        # Sort: preferred bucket first, then newest
+        pipeline.append({"$sort": {"inPref": -1, "createdEff": -1, "_id": -1}})
+    else:
+        # Default: newest first
+        pipeline.append({"$sort": {"createdEff": -1, "_id": -1}})
+
+    pipeline.append({"$skip": skip})
+    pipeline.append({"$limit": limit})
+
+    docs = await leads_col.aggregate(pipeline).to_list(length=limit)
 
     items: List[Dict[str, Any]] = []
     for d in docs:
@@ -451,12 +452,16 @@ async def leads_search(body: LeadsSearchRequest):
 
         type_key = norm_type_key_from_doc(d)
 
-        d["age_bucket"] = bucket  # ✅ UI can display this
-        d["price"] = price_for(type_key, bucket)  # ✅ ALWAYS computed from createdAt+type
+        d["age_bucket"] = bucket
+        d["price"] = price_for(type_key, bucket)
         d["caboom_retail"] = caboom_retail_for(type_key)
 
         # helpful debug fields (keep or remove later)
         d["type_key"] = type_key
+
+        # remove pipeline helper fields if present
+        d.pop("createdEff", None)
+        d.pop("inPref", None)
 
         items.append(d)
 
@@ -465,7 +470,8 @@ async def leads_search(body: LeadsSearchRequest):
         "page": page,
         "limit": limit,
         "total": total,
-        "bucket_filter": bucket_up,
+        "bucket_preference": bucket_pref,   # ✅ BOOST preference
+        "bucket_filter": "ALL",             # ✅ inventory not filtered
         "items": items,
         "query": q,
         "mongo_db": db.name,
