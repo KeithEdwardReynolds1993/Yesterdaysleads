@@ -5,30 +5,27 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 
-print("🚀 main.py loaded — pricing+bucket from createdAt (BOOST-only bucket)", flush=True)
 
 # =========================
 # CONFIG
 # =========================
 MONGO_URI = os.environ.get("MONGO_URI")
 MONGO_DB = os.environ.get("MONGO_DB", "leads")
-
-# ✅ IMPORTANT: your real Atlas collection is LeadsData (case-sensitive)
-MONGO_COLLECTION = os.environ.get("MONGO_COLLECTION", "LeadsData")
+MONGO_COLLECTION = os.environ.get("MONGO_COLLECTION", "LeadsData")  # case-sensitive
 
 SERVICE_NAME = os.environ.get("SERVICE_NAME", "yesterdaysleads")
-VERSION = os.environ.get("VERSION", "v2026-02-05-boost-only")
+VERSION = os.environ.get("VERSION", "v2026-02-05-minimal")
 
 if not MONGO_URI:
     raise RuntimeError("Missing env var MONGO_URI")
 
 # =========================
-# PRICING (Lead Type x Age Bucket) — matches your Sheet
+# PRICING (Lead Type x Age Bucket)
 # =========================
 DEFAULT_PRICING: Dict[str, Dict[str, float]] = {
     "final_expense": {
@@ -81,15 +78,27 @@ def load_pricing() -> Dict[str, Dict[str, float]]:
                     }
             return out or DEFAULT_PRICING
     except Exception:
-        pass
+        return DEFAULT_PRICING
     return DEFAULT_PRICING
 
 PRICING = load_pricing()
 
+# Map canonical lead_type_code -> pricing key
+CODE_TO_KEY = {
+    "FE": "final_expense",
+    "LIFE": "life",
+    "VET": "veteran_life",
+    "HOME": "home",
+    "AUTO": "auto",
+    "MED": "medicare",
+    "HEALTH": "health",
+    "RET": "retirement",
+}
+
 # =========================
 # APP
 # =========================
-app = FastAPI(title="Yesterday's Leads API")
+app = FastAPI(title="Yesterday's Leads API (Minimal)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -105,21 +114,23 @@ app.add_middleware(
 client = AsyncIOMotorClient(MONGO_URI)
 db = client[MONGO_DB]
 leads_col = db[MONGO_COLLECTION]
-print(f"🧠 Mongo configured → DB='{db.name}', Collection='{leads_col.name}'", flush=True)
+
 
 # =========================
 # MODELS
 # =========================
 class LeadsSearchRequest(BaseModel):
-    bucket: str = Field(default="ALL")  # ALL or YESTERDAY_72H, DAYS_4_14, etc. (BOOST ONLY)
     page: int = Field(default=1, ge=1)
     limit: int = Field(default=25, ge=1, le=200)
 
-    # optional filters
+    # hard filters only (frontend can do boost/sort)
     state: Optional[str] = None
     zip: Optional[str] = None
     lead_type_norm: Optional[str] = None
-    lead_type_code: Optional[str] = None  # FE/LIFE/VET/HOME/AUTO/MED/HEALTH/RET (optional)
+    lead_type_code: Optional[str] = None  # FE/LIFE/VET/HOME/AUTO/MED/HEALTH/RET
+
+    # Optional: restrict to available only
+    available_only: bool = Field(default=True)
 
 
 # =========================
@@ -136,64 +147,6 @@ def norm_zip(v: str) -> str:
 
 def norm_state(v: str) -> str:
     return (v or "").strip().upper()
-
-def norm_bucket(v: str) -> str:
-    b = (v or "").strip()
-    if not b:
-        return "ALL"
-    b = b.upper()
-    aliases = {
-        "YESTERDAY_72": "YESTERDAY_72H",
-        "YESTERDAY": "YESTERDAY_72H",
-        "YESTERDAY_72H": "YESTERDAY_72H",
-        "4_14": "DAYS_4_14",
-        "DAYS_4_14": "DAYS_4_14",
-        "15_30": "DAYS_15_30",
-        "DAYS_15_30": "DAYS_15_30",
-        "31_90": "DAYS_31_90",
-        "DAYS_31_90": "DAYS_31_90",
-        "91_PLUS": "DAYS_91_PLUS",
-        "DAYS_91_PLUS": "DAYS_91_PLUS",
-        "ALL": "ALL",
-    }
-    return aliases.get(b, b)
-
-# Map canonical lead_type_code -> pricing key
-CODE_TO_KEY = {
-    "FE": "final_expense",
-    "LIFE": "life",
-    "VET": "veteran_life",
-    "HOME": "home",
-    "AUTO": "auto",
-    "MED": "medicare",
-    "HEALTH": "health",
-    "RET": "retirement",
-}
-
-def norm_type_key_from_doc(d: Dict[str, Any]) -> Optional[str]:
-    """
-    Prefer lead_type_code (FE/LIFE/...) because it's canonical.
-    Fallback to lead_type_norm if code missing.
-    """
-    code = (d.get("lead_type_code") or "").strip().upper()
-    if code and code in CODE_TO_KEY:
-        return CODE_TO_KEY[code]
-
-    ln = (d.get("lead_type_norm") or "").strip().lower()
-    if not ln:
-        return None
-    ln = ln.replace(" ", "_")
-    if ln in ("veteran", "vet", "veteranlife", "veteran_life"):
-        return "veteran_life"
-    if ln in ("finalexpense", "final_expense"):
-        return "final_expense"
-    if ln in ("med", "medicare"):
-        return "medicare"
-    if ln in ("ret", "retirement"):
-        return "retirement"
-    if ln in PRICING:
-        return ln
-    return None
 
 def parse_dt(v: Any) -> Optional[datetime]:
     if v is None:
@@ -221,28 +174,33 @@ def bucket_from_created_at(created_at: Optional[datetime]) -> Optional[str]:
     now = datetime.now(timezone.utc)
     age_days = (now - created_at).total_seconds() / 86400.0
 
-    if age_days < 0:
-        return "YESTERDAY_72H"
     if age_days <= 3.0:
         return "YESTERDAY_72H"
-    if 4.0 <= age_days <= 14.0:
+    if age_days <= 14.0:
         return "DAYS_4_14"
-    if 15.0 <= age_days <= 30.0:
+    if age_days <= 30.0:
         return "DAYS_15_30"
-    if 31.0 <= age_days <= 90.0:
-        return "DAYS_31_90"
-    if age_days >= 91.0:
-        return "DAYS_91_PLUS"
-
-    if age_days < 4.0:
-        return "YESTERDAY_72H"
-    if age_days < 15.0:
-        return "DAYS_4_14"
-    if age_days < 31.0:
-        return "DAYS_15_30"
-    if age_days < 91.0:
+    if age_days <= 90.0:
         return "DAYS_31_90"
     return "DAYS_91_PLUS"
+
+def type_key_from_doc(d: Dict[str, Any]) -> Optional[str]:
+    code = (d.get("lead_type_code") or "").strip().upper()
+    if code in CODE_TO_KEY:
+        return CODE_TO_KEY[code]
+
+    ln = (d.get("lead_type_norm") or "").strip().lower().replace(" ", "_")
+    if ln in ("veteran", "vet", "veteranlife", "veteran_life"):
+        return "veteran_life"
+    if ln in ("finalexpense", "final_expense"):
+        return "final_expense"
+    if ln in ("med", "medicare"):
+        return "medicare"
+    if ln in ("ret", "retirement"):
+        return "retirement"
+    if ln in PRICING:
+        return ln
+    return None
 
 def price_for(type_key: Optional[str], bucket: Optional[str]) -> Optional[float]:
     if not type_key or not bucket:
@@ -260,29 +218,27 @@ def caboom_retail_for(type_key: Optional[str]) -> Optional[float]:
         return None
     return m.get("CABOOM_RETAIL")
 
-def preferred_bucket_bounds(bucket_up: str) -> Optional[Dict[str, datetime]]:
+def allowlist_item(d: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Returns inclusive bounds for createdAt for the preferred bucket.
-    Used ONLY for ranking/boosting (not filtering).
+    Return only fields the frontend needs (NO PII).
     """
-    b = norm_bucket(bucket_up)
-    if b == "ALL":
-        return None
-
-    now = datetime.now(timezone.utc)
-
-    if b == "YESTERDAY_72H":
-        return {"start": now - timedelta(hours=72), "end": now + timedelta(days=3650)}  # open-ended future-safe
-    if b == "DAYS_4_14":
-        return {"start": now - timedelta(days=14), "end": now - timedelta(days=4)}
-    if b == "DAYS_15_30":
-        return {"start": now - timedelta(days=30), "end": now - timedelta(days=15)}
-    if b == "DAYS_31_90":
-        return {"start": now - timedelta(days=90), "end": now - timedelta(days=31)}
-    if b == "DAYS_91_PLUS":
-        return {"start": datetime(1970, 1, 1, tzinfo=timezone.utc), "end": now - timedelta(days=91)}
-
-    return None
+    return {
+        "id": d.get("id"),
+        "external_id": d.get("external_id"),
+        "lead_type_norm": d.get("lead_type_norm"),
+        "lead_type_code": d.get("lead_type_code"),
+        "state": d.get("state") or d.get("state2"),
+        "zip": d.get("zip5") or d.get("zip_code"),
+        "createdAt": d.get("createdAt") or d.get("created_at"),
+        "tier_1": d.get("tier_1"),
+        "tier_2": d.get("tier_2"),
+        "tier_3": d.get("tier_3"),
+        "tier_4": d.get("tier_4"),
+        "tier_5": d.get("tier_5"),
+        "age_bucket": d.get("age_bucket"),
+        "price": d.get("price"),
+        "caboom_retail": d.get("caboom_retail"),
+    }
 
 
 # =========================
@@ -294,84 +250,68 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"ok": True}
-
-@app.get("/__whoami")
-async def whoami():
-    return {
-        "ok": True,
-        "file": "main.py",
-        "service": SERVICE_NAME,
-        "version": VERSION,
-        "mongo_db": db.name,
-        "mongo_collection": leads_col.name,
-    }
+    return {"ok": True, "version": VERSION}
 
 @app.get("/__mongo")
 async def __mongo():
     try:
         await client.admin.command("ping")
     except Exception as e:
-        return {"ok": False, "error": str(e), "mongo_db": db.name, "mongo_collection": leads_col.name, "version": VERSION}
+        return {"ok": False, "error": str(e), "version": VERSION}
 
     total = await leads_col.count_documents({})
-    sample = await leads_col.find_one({})
-    if isinstance(sample, dict) and "_id" in sample:
-        sample["_id"] = str(sample["_id"])
-
     return {
         "ok": True,
         "mongo_db": db.name,
         "mongo_collection": leads_col.name,
         "total": total,
-        "sample_keys": sorted(list(sample.keys())) if isinstance(sample, dict) else [],
         "version": VERSION,
     }
-
-@app.get("/pricing")
-async def pricing():
-    return {"ok": True, "pricing": PRICING, "version": VERSION}
 
 @app.get("/meta/lead-types")
 async def meta_lead_types():
     norms = await leads_col.distinct("lead_type_norm")
     codes = await leads_col.distinct("lead_type_code")
 
-    norms_clean = sorted({str(s).strip() for s in norms if s is not None and str(s).strip() and str(s).strip().lower() != "unknown"})
-    codes_clean = sorted({str(s).strip().upper() for s in codes if s is not None and str(s).strip() and str(s).strip().lower() != "unknown"})
-
+    norms_clean = sorted({str(s).strip() for s in norms if s is not None and str(s).strip()})
+    codes_clean = sorted({str(s).strip().upper() for s in codes if s is not None and str(s).strip()})
     return {"ok": True, "lead_type_norm": norms_clean, "lead_type_code": codes_clean, "version": VERSION}
 
-@app.get("/leads")
-async def leads():
-    doc = await leads_col.find_one({})
-    if not doc:
-        return {"ok": True, "count": 0, "mongo_db": db.name, "mongo_collection": leads_col.name}
-
-    doc = mongo_id_to_str(doc)
-    return {"ok": True, "sample": doc, "mongo_db": db.name, "mongo_collection": leads_col.name}
+@app.get("/pricing")
+async def pricing():
+    return {"ok": True, "pricing": PRICING, "version": VERSION}
 
 @app.post("/leads/search")
 async def leads_search(body: LeadsSearchRequest):
     """
-    Key behavior:
-    - Inventory is NOT filtered by bucket (bucket is BOOST ONLY)
-    - Sort boosts the preferred bucket to the top
-    - Price is still computed per lead from its own createdAt-derived age_bucket
+    Essentials-only:
+    - Hard filters only (state/zip/type + available_only)
+    - Pagination
+    - Returns per-lead age_bucket + price based on each lead's createdAt
+    - Does NOT use any UI-selected age range to compute price
     """
     and_clauses: List[Dict[str, Any]] = []
 
-    # ---- bucket preference (BOOST ONLY) ----
-    bucket_pref = norm_bucket(body.bucket)
+    # Available-only (any tier Available)
+    if body.available_only:
+        and_clauses.append({
+            "$or": [
+                {"tier_1": "Available"},
+                {"tier_2": "Available"},
+                {"tier_3": "Available"},
+                {"tier_4": "Available"},
+                {"tier_5": "Available"},
+            ]
+        })
 
-    # ---- state filter ----
-    if body.state and str(body.state).strip():
+    # State filter
+    if body.state and body.state.strip():
         st = norm_state(body.state)
-        if st not in ("ALL STATES", "ALL", "ANY"):
+        if st not in ("ALL", "ANY", "ALL STATES"):
             and_clauses.append({"$or": [{"state": st}, {"state2": st}]})
 
-    # ---- zip filter ----
-    if body.zip and str(body.zip).strip():
+    # Zip filter
+    if body.zip and body.zip.strip():
         z = norm_zip(body.zip)
         if z:
             or_zip: List[Dict[str, Any]] = [{"zip5": z}, {"zip_code": z}]
@@ -379,17 +319,16 @@ async def leads_search(body: LeadsSearchRequest):
                 or_zip.append({"zip_code": int(z)})
             and_clauses.append({"$or": or_zip})
 
-    # ---- lead type filter (code preferred) ----
-    if body.lead_type_code and str(body.lead_type_code).strip():
-        code = str(body.lead_type_code).strip().upper()
-        if code in CODE_TO_KEY:
-            and_clauses.append({"lead_type_code": code})
+    # Lead type filter (code preferred)
+    if body.lead_type_code and body.lead_type_code.strip():
+        code = body.lead_type_code.strip().upper()
+        and_clauses.append({"lead_type_code": code})
 
-    elif body.lead_type_norm and str(body.lead_type_norm).strip():
-        lt = str(body.lead_type_norm).strip()
+    elif body.lead_type_norm and body.lead_type_norm.strip():
+        lt = body.lead_type_norm.strip()
         and_clauses.append({"lead_type_norm": {"$regex": f"^{lt}$", "$options": "i"}})
 
-    # Final match query (NO bucket filtering here)
+    # Build query
     if not and_clauses:
         q: Dict[str, Any] = {}
     elif len(and_clauses) == 1:
@@ -404,77 +343,35 @@ async def leads_search(body: LeadsSearchRequest):
 
     total = await leads_col.count_documents(q)
 
-    # ---- BOOST SORTING IN MONGO (without filtering inventory) ----
-    # Choose createdAt effective field in pipeline: createdEff = ifNull(createdAt, created_at)
-    bounds = preferred_bucket_bounds(bucket_pref)
+    # Stable sort: newest first
+    cursor = (
+        leads_col.find(q)
+        .sort([("createdAt", -1), ("_id", -1)])
+        .skip(skip)
+        .limit(limit)
+    )
 
-    pipeline: List[Dict[str, Any]] = [
-        {"$match": q},
-        {"$addFields": {"createdEff": {"$ifNull": ["$createdAt", "$created_at"]}}},
-    ]
-
-    if bounds and bucket_pref != "ALL":
-        # inPref = createdEff between [start, end] (inclusive)
-        pipeline.append({
-            "$addFields": {
-                "inPref": {
-                    "$cond": [
-                        {
-                            "$and": [
-                                {"$ne": ["$createdEff", None]},
-                                {"$gte": ["$createdEff", bounds["start"]]},
-                                {"$lte": ["$createdEff", bounds["end"]]},
-                            ]
-                        },
-                        1,
-                        0
-                    ]
-                }
-            }
-        })
-        # Sort: preferred bucket first, then newest
-        pipeline.append({"$sort": {"inPref": -1, "createdEff": -1, "_id": -1}})
-    else:
-        # Default: newest first
-        pipeline.append({"$sort": {"createdEff": -1, "_id": -1}})
-
-    pipeline.append({"$skip": skip})
-    pipeline.append({"$limit": limit})
-
-    docs = await leads_col.aggregate(pipeline).to_list(length=limit)
+    docs = await cursor.to_list(length=limit)
 
     items: List[Dict[str, Any]] = []
     for d in docs:
         d = mongo_id_to_str(d)
 
         created = parse_dt(d.get("createdAt")) or parse_dt(d.get("created_at"))
-        bucket = bucket_from_created_at(created)
+        age_bucket = bucket_from_created_at(created)
 
-        type_key = norm_type_key_from_doc(d)
-
-        d["age_bucket"] = bucket
-        d["price"] = price_for(type_key, bucket)
+        type_key = type_key_from_doc(d)
+        d["age_bucket"] = age_bucket
+        d["price"] = price_for(type_key, age_bucket)
         d["caboom_retail"] = caboom_retail_for(type_key)
 
-        # helpful debug fields (keep or remove later)
-        d["type_key"] = type_key
-
-        # remove pipeline helper fields if present
-        d.pop("createdEff", None)
-        d.pop("inPref", None)
-
-        items.append(d)
+        items.append(allowlist_item(d))
 
     return {
         "ok": True,
         "page": page,
         "limit": limit,
         "total": total,
-        "bucket_preference": bucket_pref,   # ✅ BOOST preference
-        "bucket_filter": "ALL",             # ✅ inventory not filtered
         "items": items,
-        "query": q,
-        "mongo_db": db.name,
-        "mongo_collection": leads_col.name,
         "version": VERSION,
     }
